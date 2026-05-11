@@ -1,0 +1,465 @@
+import pandas as pd
+import numpy as np
+
+from sklearn.ensemble import IsolationForest
+from sklearn.preprocessing import LabelEncoder
+
+
+# =========================================================
+# STEP 1 - LOAD RAW EXCEPTION DATA
+# =========================================================
+
+FILE_PATH = "exceptions.csv"
+
+df = pd.read_csv(FILE_PATH)
+
+print("\n========== RAW DATA ==========")
+print(df.head())
+
+
+# =========================================================
+# STEP 2 - STANDARDIZE COLUMN NAMES
+# =========================================================
+
+df.columns = [
+    col.strip().upper()
+    for col in df.columns
+]
+
+column_mapping = {
+    "HTI": "HTI_ID",
+    "MONITORGROUP": "MONITORING_GROUP",
+    "SNAPGROUP": "SNAP_GROUP",
+    "JOBNAME": "JOB_NAME",
+    "EXCEPTIONID": "EXCEPTION_ID",
+    "REASON": "BREAK_REASON",
+    "STATUS": "STATUS",
+    "COMMENT": "USER_COMMENT",
+    "TRADEID": "TRADE_ID",
+    "CREATEDDATE": "CREATED_TIME",
+    "SOURCE": "SOURCE_SYSTEM"
+}
+
+df.rename(
+    columns=column_mapping,
+    inplace=True
+)
+
+print("\n========== STANDARDIZED COLUMNS ==========")
+print(df.columns)
+
+
+# =========================================================
+# STEP 3 - VALIDATE MANDATORY COLUMNS
+# =========================================================
+
+mandatory_cols = [
+    "HTI_ID",
+    "MONITORING_GROUP",
+    "SNAP_GROUP",
+    "JOB_NAME",
+    "EXCEPTION_ID",
+    "BREAK_REASON",
+    "STATUS",
+    "TRADE_ID",
+    "CREATED_TIME"
+]
+
+missing_cols = [
+    col for col in mandatory_cols
+    if col not in df.columns
+]
+
+if missing_cols:
+    raise Exception(
+        f"Missing mandatory columns: {missing_cols}"
+    )
+
+print("\n[INFO] Validation Successful")
+
+
+# =========================================================
+# STEP 4 - DATA CLEANING
+# =========================================================
+
+df["STATUS"] = (
+    df["STATUS"]
+    .astype(str)
+    .str.upper()
+)
+
+df["BREAK_REASON"] = (
+    df["BREAK_REASON"]
+    .astype(str)
+)
+
+df["USER_COMMENT"] = (
+    df["USER_COMMENT"]
+    .astype(str)
+)
+
+df["CREATED_TIME"] = pd.to_datetime(
+    df["CREATED_TIME"],
+    errors="coerce"
+)
+
+print("\n========== CLEANED DATA ==========")
+print(df.head())
+
+
+# =========================================================
+# STEP 5 - BUILD CONTROL HIERARCHY
+# =========================================================
+
+hierarchy_df = df[
+    [
+        "HTI_ID",
+        "MONITORING_GROUP",
+        "SNAP_GROUP",
+        "JOB_NAME"
+    ]
+].drop_duplicates()
+
+print("\n========== CONTROL HIERARCHY ==========")
+print(hierarchy_df.head())
+
+
+# =========================================================
+# STEP 6 - SEVERITY ENGINE
+# =========================================================
+
+severity_rules = {
+    "Threshold Breach": "HIGH",
+    "Recon Break": "HIGH",
+    "Missing Trade": "MEDIUM",
+    "Late Feed": "LOW",
+    "Static Data Issue": "LOW"
+}
+
+df["SEVERITY"] = (
+    df["BREAK_REASON"]
+    .map(severity_rules)
+    .fillna("MEDIUM")
+)
+
+print("\n========== SEVERITY ASSIGNED ==========")
+print(
+    df[
+        [
+            "BREAK_REASON",
+            "SEVERITY"
+        ]
+    ].head()
+)
+
+
+# =========================================================
+# STEP 7 - AGING CALCULATION
+# =========================================================
+
+current_time = pd.Timestamp.now()
+
+df["AGING_DAYS"] = (
+    current_time - df["CREATED_TIME"]
+).dt.days
+
+print("\n========== AGING ==========")
+print(
+    df[
+        [
+            "EXCEPTION_ID",
+            "AGING_DAYS"
+        ]
+    ].head()
+)
+
+
+# =========================================================
+# STEP 8 - REPEAT BREAK DETECTION
+# =========================================================
+
+repeat_counts = (
+    df.groupby(
+        [
+            "TRADE_ID",
+            "BREAK_REASON"
+        ]
+    )
+    .size()
+    .reset_index(name="REPEAT_COUNT")
+)
+
+df = df.merge(
+    repeat_counts,
+    on=[
+        "TRADE_ID",
+        "BREAK_REASON"
+    ],
+    how="left"
+)
+
+df["IS_REPEAT_BREAK"] = (
+    df["REPEAT_COUNT"] > 1
+)
+
+print("\n========== REPEAT BREAKS ==========")
+print(
+    df[
+        [
+            "TRADE_ID",
+            "BREAK_REASON",
+            "REPEAT_COUNT",
+            "IS_REPEAT_BREAK"
+        ]
+    ].head()
+)
+
+
+# =========================================================
+# STEP 9 - FALSE POSITIVE DETECTION
+# =========================================================
+
+false_positive_keywords = [
+    "false positive",
+    "known issue",
+    "expected",
+    "ignore"
+]
+
+
+def identify_false_positive(comment):
+
+    comment = str(comment).lower()
+
+    return any(
+        keyword in comment
+        for keyword in false_positive_keywords
+    )
+
+
+df["IS_FALSE_POSITIVE"] = (
+    df["USER_COMMENT"]
+    .apply(identify_false_positive)
+)
+
+print("\n========== FALSE POSITIVE DETECTION ==========")
+print(
+    df[
+        [
+            "USER_COMMENT",
+            "IS_FALSE_POSITIVE"
+        ]
+    ].head()
+)
+
+
+# =========================================================
+# STEP 10 - RCA EXTRACTION
+# =========================================================
+
+rca_keywords = {
+    "Late Feed": [
+        "late feed",
+        "delayed upstream",
+        "feed issue"
+    ],
+    "Static Data": [
+        "static data",
+        "mapping issue"
+    ],
+    "Booking Issue": [
+        "booking delay",
+        "trade booking"
+    ],
+    "Market Movement": [
+        "market volatility",
+        "rate movement"
+    ]
+}
+
+
+def identify_rca(comment):
+
+    comment = str(comment).lower()
+
+    for rca, keywords in rca_keywords.items():
+
+        for keyword in keywords:
+
+            if keyword in comment:
+                return rca
+
+    return "OTHER"
+
+
+df["RCA_CATEGORY"] = (
+    df["USER_COMMENT"]
+    .apply(identify_rca)
+)
+
+print("\n========== RCA CATEGORY ==========")
+print(
+    df[
+        [
+            "USER_COMMENT",
+            "RCA_CATEGORY"
+        ]
+    ].head()
+)
+
+
+# =========================================================
+# STEP 11 - ENCODE FEATURES FOR ML
+# =========================================================
+
+label_encoders = {}
+
+categorical_cols = [
+    "HTI_ID",
+    "MONITORING_GROUP",
+    "SNAP_GROUP",
+    "JOB_NAME",
+    "BREAK_REASON",
+    "STATUS",
+    "SEVERITY",
+    "RCA_CATEGORY"
+]
+
+for col in categorical_cols:
+
+    le = LabelEncoder()
+
+    df[col + "_ENCODED"] = le.fit_transform(
+        df[col].astype(str)
+    )
+
+    label_encoders[col] = le
+
+
+# =========================================================
+# STEP 12 - PREPARE ML FEATURES
+# =========================================================
+
+feature_cols = [
+    "AGING_DAYS",
+    "REPEAT_COUNT",
+    "HTI_ID_ENCODED",
+    "MONITORING_GROUP_ENCODED",
+    "SNAP_GROUP_ENCODED",
+    "JOB_NAME_ENCODED",
+    "BREAK_REASON_ENCODED",
+    "STATUS_ENCODED",
+    "SEVERITY_ENCODED",
+    "RCA_CATEGORY_ENCODED"
+]
+
+X = df[feature_cols].fillna(0)
+
+print("\n========== ML FEATURES ==========")
+print(X.head())
+
+
+# =========================================================
+# STEP 13 - TRAIN ANOMALY DETECTION MODEL
+# =========================================================
+
+model = IsolationForest(
+    contamination=0.05,
+    random_state=42
+)
+
+model.fit(X)
+
+print("\n[INFO] Isolation Forest Model Trained")
+
+
+# =========================================================
+# STEP 14 - PREDICT ANOMALIES
+# =========================================================
+
+predictions = model.predict(X)
+
+df["ANOMALY_FLAG"] = predictions
+
+df["ANOMALY_STATUS"] = np.where(
+    df["ANOMALY_FLAG"] == -1,
+    "ANOMALY",
+    "NORMAL"
+)
+
+print("\n========== ANOMALY RESULTS ==========")
+
+print(
+    df[
+        [
+            "EXCEPTION_ID",
+            "BREAK_REASON",
+            "AGING_DAYS",
+            "REPEAT_COUNT",
+            "ANOMALY_STATUS"
+        ]
+    ].head(20)
+)
+
+
+# =========================================================
+# STEP 15 - GENERATE OPERATIONAL METRICS
+# =========================================================
+
+metrics = {
+    "TOTAL_EXCEPTIONS": len(df),
+
+    "OPEN_EXCEPTIONS":
+        len(df[df["STATUS"] == "OPEN"]),
+
+    "HIGH_SEVERITY":
+        len(df[df["SEVERITY"] == "HIGH"]),
+
+    "REPEAT_BREAKS":
+        len(df[df["IS_REPEAT_BREAK"]]),
+
+    "FALSE_POSITIVES":
+        len(df[df["IS_FALSE_POSITIVE"]]),
+
+    "ANOMALIES":
+        len(df[df["ANOMALY_STATUS"] == "ANOMALY"])
+}
+
+print("\n========== OPERATIONAL METRICS ==========")
+
+for k, v in metrics.items():
+    print(f"{k}: {v}")
+
+
+# =========================================================
+# STEP 16 - SAVE OUTPUTS
+# =========================================================
+
+df.to_csv(
+    "intelligent_exceptions_output.csv",
+    index=False
+)
+
+hierarchy_df.to_csv(
+    "hierarchy_mapping.csv",
+    index=False
+)
+
+metrics_df = pd.DataFrame(
+    metrics.items(),
+    columns=["METRIC", "VALUE"]
+)
+
+metrics_df.to_csv(
+    "operational_metrics.csv",
+    index=False
+)
+
+print("\n========== PROCESS COMPLETED ==========")
+
+print("""
+Generated Files:
+1. intelligent_exceptions_output.csv
+2. hierarchy_mapping.csv
+3. operational_metrics.csv
+""")
