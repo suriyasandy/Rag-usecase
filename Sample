@@ -1,13 +1,38 @@
 # =========================================================
-# MMO / CONTROL INTELLIGENCE PLATFORM
-# EXPLAINABLE BUSINESS-DRIVEN ANOMALY DETECTION
+# CONTROL DISCOVERY & EFFECTIVENESS PLATFORM
+# PHASE 1 + PHASE 2
+# =========================================================
+#
+# FEATURES INCLUDED
+# -----------------
+# 1. Data Cleaning
+# 2. Operational Discovery Analytics
+# 3. Monitoring Group Risk Analysis
+# 4. Product Risk Concentration
+# 5. Aging / SLA Analysis
+# 6. Repeat Break Detection
+# 7. Source System Stability
+# 8. Scenario Risk Analysis
+# 9. Control Effectiveness Scoring
+# 10. Business Risk Ranking
+# 11. Executive Summary Reports
+#
+# OUTPUT FILES
+# ------------
+# 1. cleaned_exceptions.csv
+# 2. monitoring_group_risk.csv
+# 3. product_risk.csv
+# 4. aging_analysis.csv
+# 5. repeat_breaks.csv
+# 6. source_system_analysis.csv
+# 7. scenario_analysis.csv
+# 8. control_effectiveness.csv
+# 9. executive_summary.csv
+#
 # =========================================================
 
 import pandas as pd
 import numpy as np
-
-from sklearn.preprocessing import LabelEncoder
-from sklearn.ensemble import IsolationForest
 
 
 # =========================================================
@@ -41,36 +66,45 @@ print(df.columns.tolist())
 
 important_cols = [
 
-    # Hierarchy
-    "MONITORING_GROUP",
-    "SNAP_REF",
-    "JOB_GROUP",
-
     # Exception
     "EXCEPTION_TYPE",
     "CASE_NAME",
     "CASE_DESCRIPTION",
 
-    # Risk
-    "MEASURE",
-    "RISK_SOURCE",
-    "SCENARIO",
+    # Hierarchy
+    "MONITORING_GROUP",
+    "SNAP_REF",
+    "JOB_GROUP",
 
-    # Trade/Product
+    # Time
+    "COB_DATE",
+    "AGE",
+
+    # Product / Trade
     "TRADE_TYPE",
     "PRODUCT",
     "ISDA_PRODUCT",
 
-    # Entity/System
+    # Risk
+    "RISK_SOURCE",
+    "SCENARIO",
+    "MEASURE",
+
+    # Systems
+    "ORIGINATING_SYSTEM",
     "SOURCE_SYSTEM",
+
+    # Entity
     "HMS_ENTITY",
     "HMS_DESK_NAME",
 
-    # Metrics
-    "AGE",
+    # Financial
     "EXCEPTION_VALUE",
     "COMPARISON_VALUE",
     "NOTIONAL",
+
+    # Attributes
+    "ATTRIBUTE_CHECKED",
 
     # IDs
     "ID(HTI_/_HPI)"
@@ -83,12 +117,12 @@ available_cols = [
 
 df = df[available_cols]
 
-print("\n========== SELECTED DATA ==========")
+print("\n========== IMPORTANT DATA ==========")
 print(df.head())
 
 
 # =========================================================
-# STEP 4 - DATA CLEANING
+# STEP 4 - CLEAN NUMERIC COLUMNS
 # =========================================================
 
 numeric_cols = [
@@ -106,6 +140,8 @@ for col in numeric_cols:
             df[col]
             .astype(str)
             .str.replace(",", "")
+            .str.replace("(", "-")
+            .str.replace(")", "")
         )
 
         df[col] = pd.to_numeric(
@@ -115,201 +151,332 @@ for col in numeric_cols:
 
         df[col] = df[col].fillna(0)
 
-# Fill remaining nulls
-df = df.fillna("UNKNOWN")
+
+# =========================================================
+# STEP 5 - CLEAN DATE COLUMNS
+# =========================================================
+
+if "COB_DATE" in df.columns:
+
+    df["COB_DATE"] = pd.to_datetime(
+        df["COB_DATE"],
+        errors="coerce"
+    )
 
 
 # =========================================================
-# STEP 5 - BUSINESS SEVERITY ENGINE
+# STEP 6 - HANDLE NULLS
 # =========================================================
 
-def assign_severity(row):
+categorical_cols = df.select_dtypes(
+    include=["object"]
+).columns
 
-    if (
-        row["AGE"] > 10 or
-        row["NOTIONAL"] > 10000000
-    ):
-        return "HIGH"
-
-    elif (
-        row["AGE"] > 5 or
-        row["NOTIONAL"] > 1000000
-    ):
-        return "MEDIUM"
-
-    return "LOW"
+for col in categorical_cols:
+    df[col] = df[col].fillna("UNKNOWN")
 
 
-df["SEVERITY"] = df.apply(
-    assign_severity,
-    axis=1
+# =========================================================
+# STEP 7 - SAVE CLEANED DATA
+# =========================================================
+
+df.to_csv(
+    "cleaned_exceptions.csv",
+    index=False
 )
 
+print("\n[INFO] Cleaned dataset saved")
+
 
 # =========================================================
-# STEP 6 - PEER GROUP BASELINES
+# STEP 8 - MONITORING GROUP RISK ANALYSIS
 # =========================================================
 
-peer_group_cols = [
-    "MONITORING_GROUP",
-    "PRODUCT",
-    "MEASURE"
-]
+monitoring_group_risk = (
 
-peer_stats = (
-
-    df.groupby(peer_group_cols)
+    df.groupby("MONITORING_GROUP")
     .agg({
 
-        "EXCEPTION_VALUE": [
-            "mean",
-            "std"
-        ],
+        "CASE_NAME": "count",
+        "AGE": "mean",
+        "NOTIONAL": "sum",
+        "EXCEPTION_VALUE": "mean"
+
+    })
+
+    .reset_index()
+
+)
+
+monitoring_group_risk.columns = [
+
+    "MONITORING_GROUP",
+    "TOTAL_EXCEPTIONS",
+    "AVG_AGE",
+    "TOTAL_NOTIONAL",
+    "AVG_EXCEPTION_VALUE"
+]
+
+monitoring_group_risk = monitoring_group_risk.sort_values(
+    by="TOTAL_EXCEPTIONS",
+    ascending=False
+)
+
+print("\n========== TOP MONITORING GROUPS ==========")
+print(monitoring_group_risk.head(10))
+
+
+# =========================================================
+# STEP 9 - PRODUCT RISK ANALYSIS
+# =========================================================
+
+product_risk = (
+
+    df.groupby("PRODUCT")
+    .agg({
+
+        "CASE_NAME": "count",
+        "NOTIONAL": "sum",
+        "AGE": "mean"
+
+    })
+
+    .reset_index()
+
+)
+
+product_risk.columns = [
+
+    "PRODUCT",
+    "TOTAL_EXCEPTIONS",
+    "TOTAL_NOTIONAL",
+    "AVG_AGE"
+]
+
+product_risk = product_risk.sort_values(
+    by="TOTAL_EXCEPTIONS",
+    ascending=False
+)
+
+print("\n========== PRODUCT HOTSPOTS ==========")
+print(product_risk.head(10))
+
+
+# =========================================================
+# STEP 10 - AGING / SLA ANALYSIS
+# =========================================================
+
+aging_analysis = (
+
+    df.groupby("CASE_NAME")
+    .agg({
 
         "AGE": [
             "mean",
-            "std"
-        ],
-
-        "NOTIONAL": [
-            "mean",
-            "std"
+            "max",
+            "count"
         ]
+
     })
 
 )
 
-peer_stats.columns = [
-
-    "PEER_EXCEPTION_MEAN",
-    "PEER_EXCEPTION_STD",
-
-    "PEER_AGE_MEAN",
-    "PEER_AGE_STD",
-
-    "PEER_NOTIONAL_MEAN",
-    "PEER_NOTIONAL_STD"
+aging_analysis.columns = [
+    "AVG_AGE",
+    "MAX_AGE",
+    "TOTAL_EXCEPTIONS"
 ]
 
-peer_stats = peer_stats.reset_index()
+aging_analysis = aging_analysis.reset_index()
 
-df = df.merge(
-    peer_stats,
-    on=peer_group_cols,
-    how="left"
+aging_analysis = aging_analysis.sort_values(
+    by="MAX_AGE",
+    ascending=False
 )
+
+print("\n========== AGING ANALYSIS ==========")
+print(aging_analysis.head(10))
 
 
 # =========================================================
-# STEP 7 - PEER DEVIATION CALCULATION
+# STEP 11 - REPEAT BREAK ANALYSIS
 # =========================================================
 
-df["EXCEPTION_DEVIATION"] = (
-    (
-        df["EXCEPTION_VALUE"] -
-        df["PEER_EXCEPTION_MEAN"]
-    )
-    /
-    (
-        df["PEER_EXCEPTION_STD"] + 1
-    )
-)
+repeat_breaks = (
 
-df["AGE_DEVIATION"] = (
-    (
-        df["AGE"] -
-        df["PEER_AGE_MEAN"]
+    df.groupby(
+        [
+            "MONITORING_GROUP",
+            "CASE_NAME",
+            "PRODUCT"
+        ]
     )
-    /
-    (
-        df["PEER_AGE_STD"] + 1
-    )
-)
 
-df["NOTIONAL_DEVIATION"] = (
-    (
-        df["NOTIONAL"] -
-        df["PEER_NOTIONAL_MEAN"]
-    )
-    /
-    (
-        df["PEER_NOTIONAL_STD"] + 1
-    )
-)
-
-
-# =========================================================
-# STEP 8 - REPEAT BREAK ANALYSIS
-# =========================================================
-
-repeat_cols = [
-    "MONITORING_GROUP",
-    "CASE_NAME",
-    "PRODUCT"
-]
-
-repeat_counts = (
-    df.groupby(repeat_cols)
     .size()
+
     .reset_index(name="REPEAT_COUNT")
+
 )
 
-df = df.merge(
-    repeat_counts,
-    on=repeat_cols,
-    how="left"
+repeat_breaks = repeat_breaks.sort_values(
+    by="REPEAT_COUNT",
+    ascending=False
 )
 
-df["IS_REPEAT_BREAK"] = (
-    df["REPEAT_COUNT"] > 3
-)
+print("\n========== REPEAT BREAKS ==========")
+print(repeat_breaks.head(10))
 
 
 # =========================================================
-# STEP 9 - BUSINESS RISK SCORE
+# STEP 12 - SOURCE SYSTEM ANALYSIS
 # =========================================================
 
-def calculate_business_risk(row):
+source_system_analysis = (
 
-    score = 0
+    df.groupby("SOURCE_SYSTEM")
+    .agg({
 
-    # Exception deviation
-    if row["EXCEPTION_DEVIATION"] > 3:
-        score += 30
+        "CASE_NAME": "count",
+        "NOTIONAL": "sum"
 
-    elif row["EXCEPTION_DEVIATION"] > 2:
-        score += 20
+    })
 
-    # Aging deviation
-    if row["AGE_DEVIATION"] > 2:
-        score += 20
+    .reset_index()
 
-    # Notional deviation
-    if row["NOTIONAL_DEVIATION"] > 3:
-        score += 20
+)
 
-    # Repeat breaks
-    if row["IS_REPEAT_BREAK"]:
-        score += 15
+source_system_analysis.columns = [
 
-    # Severity
-    if row["SEVERITY"] == "HIGH":
-        score += 15
+    "SOURCE_SYSTEM",
+    "TOTAL_EXCEPTIONS",
+    "TOTAL_NOTIONAL"
+]
 
-    return score
+source_system_analysis = source_system_analysis.sort_values(
+    by="TOTAL_EXCEPTIONS",
+    ascending=False
+)
+
+print("\n========== SOURCE SYSTEM ANALYSIS ==========")
+print(source_system_analysis.head(10))
 
 
-df["BUSINESS_RISK_SCORE"] = df.apply(
-    calculate_business_risk,
-    axis=1
+# =========================================================
+# STEP 13 - SCENARIO ANALYSIS
+# =========================================================
+
+if "SCENARIO" in df.columns:
+
+    scenario_analysis = (
+
+        df.groupby("SCENARIO")
+        .agg({
+
+            "CASE_NAME": "count",
+            "NOTIONAL": "sum",
+            "AGE": "mean"
+
+        })
+
+        .reset_index()
+
+    )
+
+    scenario_analysis.columns = [
+
+        "SCENARIO",
+        "TOTAL_EXCEPTIONS",
+        "TOTAL_NOTIONAL",
+        "AVG_AGE"
+    ]
+
+    scenario_analysis = scenario_analysis.sort_values(
+        by="TOTAL_EXCEPTIONS",
+        ascending=False
+    )
+
+else:
+
+    scenario_analysis = pd.DataFrame()
+
+
+print("\n========== SCENARIO ANALYSIS ==========")
+print(scenario_analysis.head(10))
+
+
+# =========================================================
+# STEP 14 - ATTRIBUTE FAILURE ANALYSIS
+# =========================================================
+
+if "ATTRIBUTE_CHECKED" in df.columns:
+
+    attribute_analysis = (
+
+        df.groupby("ATTRIBUTE_CHECKED")
+        .size()
+        .reset_index(name="TOTAL_FAILURES")
+
+    )
+
+    attribute_analysis = attribute_analysis.sort_values(
+        by="TOTAL_FAILURES",
+        ascending=False
+    )
+
+else:
+
+    attribute_analysis = pd.DataFrame()
+
+
+print("\n========== ATTRIBUTE FAILURE ANALYSIS ==========")
+print(attribute_analysis.head(10))
+
+
+# =========================================================
+# STEP 15 - CONTROL EFFECTIVENESS SCORING
+# =========================================================
+
+control_effectiveness = monitoring_group_risk.copy()
+
+# Normalize metrics
+
+control_effectiveness["EXCEPTION_SCORE"] = (
+
+    control_effectiveness["TOTAL_EXCEPTIONS"]
+    /
+    control_effectiveness["TOTAL_EXCEPTIONS"].max()
+
+) * 40
+
+control_effectiveness["AGING_SCORE"] = (
+
+    control_effectiveness["AVG_AGE"]
+    /
+    control_effectiveness["AVG_AGE"].max()
+
+) * 30
+
+control_effectiveness["NOTIONAL_SCORE"] = (
+
+    control_effectiveness["TOTAL_NOTIONAL"]
+    /
+    control_effectiveness["TOTAL_NOTIONAL"].max()
+
+) * 30
+
+
+# Final risk score
+control_effectiveness["CONTROL_RISK_SCORE"] = (
+
+    control_effectiveness["EXCEPTION_SCORE"] +
+    control_effectiveness["AGING_SCORE"] +
+    control_effectiveness["NOTIONAL_SCORE"]
+
 )
 
 
-# =========================================================
-# STEP 10 - BUSINESS PRIORITY
-# =========================================================
-
-def assign_priority(score):
+# Risk bucket
+def assign_risk_bucket(score):
 
     if score >= 70:
         return "CRITICAL"
@@ -323,268 +490,188 @@ def assign_priority(score):
     return "LOW"
 
 
-df["BUSINESS_PRIORITY"] = (
-    df["BUSINESS_RISK_SCORE"]
-    .apply(assign_priority)
+control_effectiveness["RISK_BUCKET"] = (
+
+    control_effectiveness["CONTROL_RISK_SCORE"]
+    .apply(assign_risk_bucket)
+
 )
 
-
-# =========================================================
-# STEP 11 - ML ANOMALY DETECTION
-# =========================================================
-
-feature_cols = [
-
-    "EXCEPTION_DEVIATION",
-    "AGE_DEVIATION",
-    "NOTIONAL_DEVIATION",
-    "REPEAT_COUNT",
-    "BUSINESS_RISK_SCORE"
-]
-
-X = df[feature_cols].fillna(0)
-
-model = IsolationForest(
-    contamination=0.03,
-    random_state=42
+control_effectiveness = control_effectiveness.sort_values(
+    by="CONTROL_RISK_SCORE",
+    ascending=False
 )
 
-model.fit(X)
-
-predictions = model.predict(X)
-
-df["ML_ANOMALY_FLAG"] = predictions
-
-df["ML_ANOMALY_STATUS"] = np.where(
-    df["ML_ANOMALY_FLAG"] == -1,
-    "ANOMALY",
-    "NORMAL"
-)
+print("\n========== CONTROL EFFECTIVENESS ==========")
+print(control_effectiveness.head(10))
 
 
 # =========================================================
-# STEP 12 - EXPLAINABILITY ENGINE
-# =========================================================
-
-def generate_explanation(row):
-
-    reasons = []
-
-    if row["EXCEPTION_DEVIATION"] > 2:
-        reasons.append(
-            "Exception value significantly exceeds peer baseline"
-        )
-
-    if row["AGE_DEVIATION"] > 2:
-        reasons.append(
-            "Exception aging exceeds normal SLA"
-        )
-
-    if row["NOTIONAL_DEVIATION"] > 2:
-        reasons.append(
-            "High notional impact compared to peers"
-        )
-
-    if row["IS_REPEAT_BREAK"]:
-        reasons.append(
-            "Repeated break pattern detected"
-        )
-
-    if row["ML_ANOMALY_STATUS"] == "ANOMALY":
-        reasons.append(
-            "ML model detected abnormal operational behavior"
-        )
-
-    if len(reasons) == 0:
-        reasons.append(
-            "Within expected operational range"
-        )
-
-    return " | ".join(reasons)
-
-
-df["BUSINESS_EXPLANATION"] = df.apply(
-    generate_explanation,
-    axis=1
-)
-
-
-# =========================================================
-# STEP 13 - BUSINESS NARRATIVE
+# STEP 16 - BUSINESS NARRATIVES
 # =========================================================
 
 def generate_narrative(row):
 
     return f"""
-Case {row['CASE_NAME']} in monitoring group
-{row['MONITORING_GROUP']} for product
-{row['PRODUCT']} has been classified as
-{row['BUSINESS_PRIORITY']} priority.
+Monitoring Group:
+{row['MONITORING_GROUP']}
+
+Risk Bucket:
+{row['RISK_BUCKET']}
+
+Risk Score:
+{round(row['CONTROL_RISK_SCORE'], 2)}
 
 Reason:
-{row['BUSINESS_EXPLANATION']}
+- Total exceptions are elevated
+- Average aging indicates operational delay
+- Financial exposure is significant
 
-Business Risk Score:
-{row['BUSINESS_RISK_SCORE']}
+Business Impact:
+Control group requires operational review
+and possible threshold/rule optimization.
 """
 
 
-df["BUSINESS_NARRATIVE"] = df.apply(
-    generate_narrative,
-    axis=1
+control_effectiveness["BUSINESS_NARRATIVE"] = (
+    control_effectiveness.apply(
+        generate_narrative,
+        axis=1
+    )
 )
 
+print("\n========== SAMPLE NARRATIVES ==========")
+
+for _, row in control_effectiveness.head(3).iterrows():
+
+    print("\n--------------------------------")
+    print(row["BUSINESS_NARRATIVE"])
+
 
 # =========================================================
-# STEP 14 - EXECUTIVE DASHBOARD METRICS
+# STEP 17 - EXECUTIVE SUMMARY
 # =========================================================
 
-metrics = {
+executive_summary = {
 
     "TOTAL_EXCEPTIONS":
         len(df),
 
-    "CRITICAL_EXCEPTIONS":
-        len(
-            df[
-                df["BUSINESS_PRIORITY"]
-                == "CRITICAL"
-            ]
-        ),
+    "TOTAL_MONITORING_GROUPS":
+        df["MONITORING_GROUP"].nunique(),
 
-    "HIGH_PRIORITY":
-        len(
-            df[
-                df["BUSINESS_PRIORITY"]
-                == "HIGH"
-            ]
-        ),
+    "TOTAL_PRODUCTS":
+        df["PRODUCT"].nunique(),
 
-    "ML_ANOMALIES":
-        len(
-            df[
-                df["ML_ANOMALY_STATUS"]
-                == "ANOMALY"
-            ]
-        ),
+    "TOTAL_SOURCE_SYSTEMS":
+        df["SOURCE_SYSTEM"].nunique(),
 
-    "REPEAT_BREAKS":
-        len(
-            df[
-                df["IS_REPEAT_BREAK"]
-            ]
-        ),
-
-    "AVG_AGE":
-        round(
-            df["AGE"].mean(),
-            2
-        ),
+    "AVG_EXCEPTION_AGE":
+        round(df["AGE"].mean(), 2),
 
     "TOTAL_NOTIONAL_IMPACT":
-        round(
-            df["NOTIONAL"].sum(),
-            2
-        )
+        round(df["NOTIONAL"].sum(), 2),
+
+    "TOP_RISK_MONITORING_GROUP":
+        control_effectiveness.iloc[0]["MONITORING_GROUP"],
+
+    "TOP_PRODUCT":
+        product_risk.iloc[0]["PRODUCT"]
+
 }
 
 
-print("\n========== EXECUTIVE METRICS ==========")
+print("\n========== EXECUTIVE SUMMARY ==========")
 
-for k, v in metrics.items():
+for k, v in executive_summary.items():
     print(f"{k}: {v}")
 
 
 # =========================================================
-# STEP 15 - TOP RISKY MONITORING GROUPS
+# STEP 18 - SAVE OUTPUTS
 # =========================================================
 
-risk_summary = (
-
-    df.groupby("MONITORING_GROUP")
-    .agg({
-
-        "BUSINESS_RISK_SCORE": "mean",
-        "NOTIONAL": "sum",
-        "CASE_NAME": "count"
-
-    })
-
-    .reset_index()
-
-)
-
-risk_summary.columns = [
-
-    "MONITORING_GROUP",
-    "AVG_RISK_SCORE",
-    "TOTAL_NOTIONAL",
-    "TOTAL_EXCEPTIONS"
-]
-
-risk_summary = risk_summary.sort_values(
-    by="AVG_RISK_SCORE",
-    ascending=False
-)
-
-print("\n========== TOP RISKY GROUPS ==========")
-
-print(risk_summary.head(10))
-
-
-# =========================================================
-# STEP 16 - SAVE BUSINESS OUTPUTS
-# =========================================================
-
-df.to_csv(
-    "business_control_intelligence_output.csv",
+monitoring_group_risk.to_csv(
+    "monitoring_group_risk.csv",
     index=False
 )
 
-risk_summary.to_csv(
-    "monitoring_group_risk_summary.csv",
+product_risk.to_csv(
+    "product_risk.csv",
     index=False
 )
 
-metrics_df = pd.DataFrame(
-    metrics.items(),
+aging_analysis.to_csv(
+    "aging_analysis.csv",
+    index=False
+)
+
+repeat_breaks.to_csv(
+    "repeat_breaks.csv",
+    index=False
+)
+
+source_system_analysis.to_csv(
+    "source_system_analysis.csv",
+    index=False
+)
+
+scenario_analysis.to_csv(
+    "scenario_analysis.csv",
+    index=False
+)
+
+control_effectiveness.to_csv(
+    "control_effectiveness.csv",
+    index=False
+)
+
+attribute_analysis.to_csv(
+    "attribute_failure_analysis.csv",
+    index=False
+)
+
+summary_df = pd.DataFrame(
+    executive_summary.items(),
     columns=["METRIC", "VALUE"]
 )
 
-metrics_df.to_csv(
-    "executive_dashboard_metrics.csv",
+summary_df.to_csv(
+    "executive_summary.csv",
     index=False
 )
 
 
 # =========================================================
-# STEP 17 - SAMPLE BUSINESS OUTPUT
+# STEP 19 - FINAL MESSAGE
 # =========================================================
-
-print("\n========== SAMPLE BUSINESS NARRATIVES ==========")
-
-sample_cases = df.head(5)
-
-for _, row in sample_cases.iterrows():
-
-    print("\n----------------------------------")
-    print(row["BUSINESS_NARRATIVE"])
-
 
 print("\n========== PROCESS COMPLETED ==========")
 
 print("""
 Generated Outputs:
 
-1. business_control_intelligence_output.csv
-2. monitoring_group_risk_summary.csv
-3. executive_dashboard_metrics.csv
+1. cleaned_exceptions.csv
+2. monitoring_group_risk.csv
+3. product_risk.csv
+4. aging_analysis.csv
+5. repeat_breaks.csv
+6. source_system_analysis.csv
+7. scenario_analysis.csv
+8. control_effectiveness.csv
+9. attribute_failure_analysis.csv
+10. executive_summary.csv
 
-Business Features Added:
-- Peer group anomaly detection
-- Explainable AI narratives
-- Risk prioritization
-- Executive reporting
-- Operational intelligence
-- Context-aware anomaly detection
+PHASE 1:
+- Operational discovery analytics
+- Product concentration
+- Repeat breaks
+- SLA analysis
+- Source system instability
+
+PHASE 2:
+- Control effectiveness scoring
+- Business risk ranking
+- Explainable narratives
+- Executive intelligence
 """)
