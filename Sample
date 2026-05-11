@@ -1,3 +1,8 @@
+# =========================================================
+# MMO / CONTROL INTELLIGENCE PLATFORM
+# EXPLAINABLE BUSINESS-DRIVEN ANOMALY DETECTION
+# =========================================================
+
 import pandas as pd
 import numpy as np
 
@@ -31,29 +36,43 @@ print(df.columns.tolist())
 
 
 # =========================================================
-# STEP 3 - SELECT IMPORTANT COLUMNS
+# STEP 3 - IMPORTANT COLUMNS
 # =========================================================
 
 important_cols = [
-    "EXCEPTION_TYPE",
+
+    # Hierarchy
     "MONITORING_GROUP",
     "SNAP_REF",
     "JOB_GROUP",
+
+    # Exception
+    "EXCEPTION_TYPE",
     "CASE_NAME",
     "CASE_DESCRIPTION",
-    "AGE",
+
+    # Risk
+    "MEASURE",
+    "RISK_SOURCE",
+    "SCENARIO",
+
+    # Trade/Product
     "TRADE_TYPE",
     "PRODUCT",
     "ISDA_PRODUCT",
-    "RISK_SOURCE",
-    "MEASURE",
-    "SCENARIO",
+
+    # Entity/System
     "SOURCE_SYSTEM",
     "HMS_ENTITY",
     "HMS_DESK_NAME",
+
+    # Metrics
+    "AGE",
     "EXCEPTION_VALUE",
     "COMPARISON_VALUE",
     "NOTIONAL",
+
+    # IDs
     "ID(HTI_/_HPI)"
 ]
 
@@ -64,7 +83,7 @@ available_cols = [
 
 df = df[available_cols]
 
-print("\n========== IMPORTANT DATA ==========")
+print("\n========== SELECTED DATA ==========")
 print(df.head())
 
 
@@ -96,24 +115,26 @@ for col in numeric_cols:
 
         df[col] = df[col].fillna(0)
 
-
-# Fill categorical nulls
+# Fill remaining nulls
 df = df.fillna("UNKNOWN")
-
-print("\n========== CLEANED DATA ==========")
-print(df.head())
 
 
 # =========================================================
-# STEP 5 - BUSINESS RULE ENGINE
+# STEP 5 - BUSINESS SEVERITY ENGINE
 # =========================================================
 
 def assign_severity(row):
 
-    if row["AGE"] > 10:
+    if (
+        row["AGE"] > 10 or
+        row["NOTIONAL"] > 10000000
+    ):
         return "HIGH"
 
-    elif row["AGE"] > 5:
+    elif (
+        row["AGE"] > 5 or
+        row["NOTIONAL"] > 1000000
+    ):
         return "MEDIUM"
 
     return "LOW"
@@ -124,122 +145,204 @@ df["SEVERITY"] = df.apply(
     axis=1
 )
 
-print("\n========== SEVERITY ==========")
-print(
-    df[
-        [
-            "AGE",
-            "SEVERITY"
+
+# =========================================================
+# STEP 6 - PEER GROUP BASELINES
+# =========================================================
+
+peer_group_cols = [
+    "MONITORING_GROUP",
+    "PRODUCT",
+    "MEASURE"
+]
+
+peer_stats = (
+
+    df.groupby(peer_group_cols)
+    .agg({
+
+        "EXCEPTION_VALUE": [
+            "mean",
+            "std"
+        ],
+
+        "AGE": [
+            "mean",
+            "std"
+        ],
+
+        "NOTIONAL": [
+            "mean",
+            "std"
         ]
-    ].head()
+    })
+
+)
+
+peer_stats.columns = [
+
+    "PEER_EXCEPTION_MEAN",
+    "PEER_EXCEPTION_STD",
+
+    "PEER_AGE_MEAN",
+    "PEER_AGE_STD",
+
+    "PEER_NOTIONAL_MEAN",
+    "PEER_NOTIONAL_STD"
+]
+
+peer_stats = peer_stats.reset_index()
+
+df = df.merge(
+    peer_stats,
+    on=peer_group_cols,
+    how="left"
 )
 
 
 # =========================================================
-# STEP 6 - REPEAT BREAK DETECTION
+# STEP 7 - PEER DEVIATION CALCULATION
 # =========================================================
 
-group_cols = [
+df["EXCEPTION_DEVIATION"] = (
+    (
+        df["EXCEPTION_VALUE"] -
+        df["PEER_EXCEPTION_MEAN"]
+    )
+    /
+    (
+        df["PEER_EXCEPTION_STD"] + 1
+    )
+)
+
+df["AGE_DEVIATION"] = (
+    (
+        df["AGE"] -
+        df["PEER_AGE_MEAN"]
+    )
+    /
+    (
+        df["PEER_AGE_STD"] + 1
+    )
+)
+
+df["NOTIONAL_DEVIATION"] = (
+    (
+        df["NOTIONAL"] -
+        df["PEER_NOTIONAL_MEAN"]
+    )
+    /
+    (
+        df["PEER_NOTIONAL_STD"] + 1
+    )
+)
+
+
+# =========================================================
+# STEP 8 - REPEAT BREAK ANALYSIS
+# =========================================================
+
+repeat_cols = [
     "MONITORING_GROUP",
     "CASE_NAME",
     "PRODUCT"
 ]
 
 repeat_counts = (
-    df.groupby(group_cols)
+    df.groupby(repeat_cols)
     .size()
     .reset_index(name="REPEAT_COUNT")
 )
 
 df = df.merge(
     repeat_counts,
-    on=group_cols,
+    on=repeat_cols,
     how="left"
 )
 
 df["IS_REPEAT_BREAK"] = (
-    df["REPEAT_COUNT"] > 1
-)
-
-print("\n========== REPEAT BREAKS ==========")
-print(
-    df[
-        [
-            "CASE_NAME",
-            "PRODUCT",
-            "REPEAT_COUNT"
-        ]
-    ].head()
+    df["REPEAT_COUNT"] > 3
 )
 
 
 # =========================================================
-# STEP 7 - ENCODE CATEGORICAL FEATURES
+# STEP 9 - BUSINESS RISK SCORE
 # =========================================================
 
-categorical_cols = [
-    "EXCEPTION_TYPE",
-    "MONITORING_GROUP",
-    "SNAP_REF",
-    "JOB_GROUP",
-    "TRADE_TYPE",
-    "PRODUCT",
-    "ISDA_PRODUCT",
-    "RISK_SOURCE",
-    "MEASURE",
-    "SCENARIO",
-    "SOURCE_SYSTEM",
-    "HMS_ENTITY",
-    "HMS_DESK_NAME",
-    "SEVERITY"
+def calculate_business_risk(row):
+
+    score = 0
+
+    # Exception deviation
+    if row["EXCEPTION_DEVIATION"] > 3:
+        score += 30
+
+    elif row["EXCEPTION_DEVIATION"] > 2:
+        score += 20
+
+    # Aging deviation
+    if row["AGE_DEVIATION"] > 2:
+        score += 20
+
+    # Notional deviation
+    if row["NOTIONAL_DEVIATION"] > 3:
+        score += 20
+
+    # Repeat breaks
+    if row["IS_REPEAT_BREAK"]:
+        score += 15
+
+    # Severity
+    if row["SEVERITY"] == "HIGH":
+        score += 15
+
+    return score
+
+
+df["BUSINESS_RISK_SCORE"] = df.apply(
+    calculate_business_risk,
+    axis=1
+)
+
+
+# =========================================================
+# STEP 10 - BUSINESS PRIORITY
+# =========================================================
+
+def assign_priority(score):
+
+    if score >= 70:
+        return "CRITICAL"
+
+    elif score >= 50:
+        return "HIGH"
+
+    elif score >= 30:
+        return "MEDIUM"
+
+    return "LOW"
+
+
+df["BUSINESS_PRIORITY"] = (
+    df["BUSINESS_RISK_SCORE"]
+    .apply(assign_priority)
+)
+
+
+# =========================================================
+# STEP 11 - ML ANOMALY DETECTION
+# =========================================================
+
+feature_cols = [
+
+    "EXCEPTION_DEVIATION",
+    "AGE_DEVIATION",
+    "NOTIONAL_DEVIATION",
+    "REPEAT_COUNT",
+    "BUSINESS_RISK_SCORE"
 ]
 
-label_encoders = {}
-
-for col in categorical_cols:
-
-    if col in df.columns:
-
-        le = LabelEncoder()
-
-        df[col + "_ENC"] = le.fit_transform(
-            df[col].astype(str)
-        )
-
-        label_encoders[col] = le
-
-
-# =========================================================
-# STEP 8 - BUILD ML FEATURE SET
-# =========================================================
-
-feature_cols = []
-
-# Numerical
-for col in numeric_cols:
-    if col in df.columns:
-        feature_cols.append(col)
-
-# Encoded categorical
-for col in categorical_cols:
-
-    enc_col = col + "_ENC"
-
-    if enc_col in df.columns:
-        feature_cols.append(enc_col)
-
-# Repeat count
-feature_cols.append("REPEAT_COUNT")
-
-X = df[feature_cols]
-
-print("\n========== ML FEATURES ==========")
-print(X.head())
-
-
-# =========================================================
-# STEP 9 - TRAIN ANOMALY DETECTION MODEL
-# =========================================================
+X = df[feature_cols].fillna(0)
 
 model = IsolationForest(
     contamination=0.03,
@@ -248,81 +351,92 @@ model = IsolationForest(
 
 model.fit(X)
 
-print("\n[INFO] Isolation Forest Trained")
-
-
-# =========================================================
-# STEP 10 - PREDICT ANOMALIES
-# =========================================================
-
 predictions = model.predict(X)
 
-df["ANOMALY_FLAG"] = predictions
+df["ML_ANOMALY_FLAG"] = predictions
 
-df["ANOMALY_STATUS"] = np.where(
-    df["ANOMALY_FLAG"] == -1,
+df["ML_ANOMALY_STATUS"] = np.where(
+    df["ML_ANOMALY_FLAG"] == -1,
     "ANOMALY",
     "NORMAL"
 )
 
-print("\n========== ANOMALY RESULTS ==========")
-
-print(
-    df[
-        [
-            "CASE_NAME",
-            "PRODUCT",
-            "AGE",
-            "NOTIONAL",
-            "EXCEPTION_VALUE",
-            "ANOMALY_STATUS"
-        ]
-    ].head(20)
-)
-
 
 # =========================================================
-# STEP 11 - RISK SCORING
+# STEP 12 - EXPLAINABILITY ENGINE
 # =========================================================
 
-def calculate_risk_score(row):
+def generate_explanation(row):
 
-    score = 0
+    reasons = []
 
-    if row["AGE"] > 10:
-        score += 30
+    if row["EXCEPTION_DEVIATION"] > 2:
+        reasons.append(
+            "Exception value significantly exceeds peer baseline"
+        )
+
+    if row["AGE_DEVIATION"] > 2:
+        reasons.append(
+            "Exception aging exceeds normal SLA"
+        )
+
+    if row["NOTIONAL_DEVIATION"] > 2:
+        reasons.append(
+            "High notional impact compared to peers"
+        )
 
     if row["IS_REPEAT_BREAK"]:
-        score += 20
+        reasons.append(
+            "Repeated break pattern detected"
+        )
 
-    if row["ANOMALY_STATUS"] == "ANOMALY":
-        score += 40
+    if row["ML_ANOMALY_STATUS"] == "ANOMALY":
+        reasons.append(
+            "ML model detected abnormal operational behavior"
+        )
 
-    if row["NOTIONAL"] > 1000000:
-        score += 10
+    if len(reasons) == 0:
+        reasons.append(
+            "Within expected operational range"
+        )
 
-    return score
+    return " | ".join(reasons)
 
 
-df["RISK_SCORE"] = df.apply(
-    calculate_risk_score,
+df["BUSINESS_EXPLANATION"] = df.apply(
+    generate_explanation,
     axis=1
 )
 
-print("\n========== RISK SCORES ==========")
 
-print(
-    df[
-        [
-            "CASE_NAME",
-            "RISK_SCORE"
-        ]
-    ].head()
+# =========================================================
+# STEP 13 - BUSINESS NARRATIVE
+# =========================================================
+
+def generate_narrative(row):
+
+    return f"""
+Case {row['CASE_NAME']} in monitoring group
+{row['MONITORING_GROUP']} for product
+{row['PRODUCT']} has been classified as
+{row['BUSINESS_PRIORITY']} priority.
+
+Reason:
+{row['BUSINESS_EXPLANATION']}
+
+Business Risk Score:
+{row['BUSINESS_RISK_SCORE']}
+"""
+
+
+df["BUSINESS_NARRATIVE"] = df.apply(
+    generate_narrative,
+    axis=1
 )
 
 
 # =========================================================
-# STEP 12 - OPERATIONAL METRICS
+# STEP 14 - EXECUTIVE DASHBOARD METRICS
 # =========================================================
 
 metrics = {
@@ -330,19 +444,27 @@ metrics = {
     "TOTAL_EXCEPTIONS":
         len(df),
 
-    "TOTAL_ANOMALIES":
+    "CRITICAL_EXCEPTIONS":
         len(
             df[
-                df["ANOMALY_STATUS"]
-                == "ANOMALY"
+                df["BUSINESS_PRIORITY"]
+                == "CRITICAL"
             ]
         ),
 
-    "HIGH_SEVERITY":
+    "HIGH_PRIORITY":
         len(
             df[
-                df["SEVERITY"]
+                df["BUSINESS_PRIORITY"]
                 == "HIGH"
+            ]
+        ),
+
+    "ML_ANOMALIES":
+        len(
+            df[
+                df["ML_ANOMALY_STATUS"]
+                == "ANOMALY"
             ]
         ),
 
@@ -354,21 +476,73 @@ metrics = {
         ),
 
     "AVG_AGE":
-        round(df["AGE"].mean(), 2)
+        round(
+            df["AGE"].mean(),
+            2
+        ),
+
+    "TOTAL_NOTIONAL_IMPACT":
+        round(
+            df["NOTIONAL"].sum(),
+            2
+        )
 }
 
-print("\n========== OPERATIONAL METRICS ==========")
+
+print("\n========== EXECUTIVE METRICS ==========")
 
 for k, v in metrics.items():
     print(f"{k}: {v}")
 
 
 # =========================================================
-# STEP 13 - SAVE OUTPUTS
+# STEP 15 - TOP RISKY MONITORING GROUPS
+# =========================================================
+
+risk_summary = (
+
+    df.groupby("MONITORING_GROUP")
+    .agg({
+
+        "BUSINESS_RISK_SCORE": "mean",
+        "NOTIONAL": "sum",
+        "CASE_NAME": "count"
+
+    })
+
+    .reset_index()
+
+)
+
+risk_summary.columns = [
+
+    "MONITORING_GROUP",
+    "AVG_RISK_SCORE",
+    "TOTAL_NOTIONAL",
+    "TOTAL_EXCEPTIONS"
+]
+
+risk_summary = risk_summary.sort_values(
+    by="AVG_RISK_SCORE",
+    ascending=False
+)
+
+print("\n========== TOP RISKY GROUPS ==========")
+
+print(risk_summary.head(10))
+
+
+# =========================================================
+# STEP 16 - SAVE BUSINESS OUTPUTS
 # =========================================================
 
 df.to_csv(
-    "mmo_exception_intelligence_output.csv",
+    "business_control_intelligence_output.csv",
+    index=False
+)
+
+risk_summary.to_csv(
+    "monitoring_group_risk_summary.csv",
     index=False
 )
 
@@ -378,14 +552,39 @@ metrics_df = pd.DataFrame(
 )
 
 metrics_df.to_csv(
-    "mmo_operational_metrics.csv",
+    "executive_dashboard_metrics.csv",
     index=False
 )
+
+
+# =========================================================
+# STEP 17 - SAMPLE BUSINESS OUTPUT
+# =========================================================
+
+print("\n========== SAMPLE BUSINESS NARRATIVES ==========")
+
+sample_cases = df.head(5)
+
+for _, row in sample_cases.iterrows():
+
+    print("\n----------------------------------")
+    print(row["BUSINESS_NARRATIVE"])
+
 
 print("\n========== PROCESS COMPLETED ==========")
 
 print("""
-Generated Files:
-1. mmo_exception_intelligence_output.csv
-2. mmo_operational_metrics.csv
+Generated Outputs:
+
+1. business_control_intelligence_output.csv
+2. monitoring_group_risk_summary.csv
+3. executive_dashboard_metrics.csv
+
+Business Features Added:
+- Peer group anomaly detection
+- Explainable AI narratives
+- Risk prioritization
+- Executive reporting
+- Operational intelligence
+- Context-aware anomaly detection
 """)
