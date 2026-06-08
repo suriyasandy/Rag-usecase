@@ -189,15 +189,21 @@ def call_rag(query: str, jwt: str, history: list) -> tuple[str, dict]:
     resp.raise_for_status()
     raw = resp.json()
 
-    # Extract answer text — try common field names
-    answer = ""
-    for key in ("answer", "response", "result", "output", "text", "content"):
-        val = raw.get(key)
-        if val and isinstance(val, str):
-            answer = val
-            break
-    if not answer:
-        answer = json.dumps(raw, indent=2)  # show full response if no known key
+    # Extract answer from your confirmed response shape:
+    # { "code": 0, "msg": "success",
+    #   "data": { "content": { "content": "<answer text>", ... } } }
+    try:
+        answer = raw["data"]["content"]["content"]
+    except (KeyError, TypeError):
+        # Fallback for any other shape
+        answer = ""
+        for key in ("answer", "response", "result", "output", "text"):
+            val = raw.get(key)
+            if val and isinstance(val, str):
+                answer = val
+                break
+        if not answer:
+            answer = json.dumps(raw, indent=2)
 
     return answer, raw
 
@@ -310,12 +316,10 @@ with st.sidebar:
         st.session_state.stage = "idle"
         st.rerun()
 
-    # Response field override
+    # Response path confirmed: raw["data"]["content"]["content"]
     st.divider()
-    st.markdown("### 🔧 Response key")
-    st.text_input("Answer field in RAG response", value="answer", key="answer_field",
-                  help="Key that holds the answer text. e.g. answer / response / result")
-    st.caption("Common values: answer / response / result / output")
+    st.markdown("### 🔎 Response path")
+    st.caption("`data → content → content`")
     st.divider()
     st.caption("🔒 Genie Bot AI Copilot · PoC")
 
@@ -380,11 +384,6 @@ if st.session_state.stage == "idle":
                     query   = L1_QUERY.format(log=log_input[:2500])
                     answer, raw = call_rag(query, jm.token, [])
 
-                    # Override answer field if user changed it
-                    af = st.session_state.get("answer_field", "answer")
-                    if af != "answer" and isinstance(raw.get(af), str):
-                        answer = raw[af]
-
                     st.session_state.log_text    = log_input
                     st.session_state.l1_answer   = answer
                     st.session_state.l1_raw_resp = raw
@@ -447,10 +446,6 @@ elif st.session_state.stage == "l1_done":
                         query, jm.token,
                         st.session_state.rag_history,   # L1 turn as history
                     )
-
-                    af = st.session_state.get("answer_field", "answer")
-                    if af != "answer" and isinstance(raw.get(af), str):
-                        answer = raw[af]
 
                     st.session_state.l2_answer   = answer
                     st.session_state.l2_raw_resp = raw
