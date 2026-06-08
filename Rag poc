@@ -3,18 +3,24 @@ genie_bot_streamlit_poc.py  —  Genie Bot L1/L2 Support PoC
 ===========================================================
 
 Flow:
-  1. User pastes log → clicks Diagnose
-  2. RAG API called → L1 resolution shown
+  1. Paste/upload log → Diagnose
+  2. RAG L1 call → display ONLY data.content.content
   3. User tries fix manually
-  4. If still broken → clicks "Escalate to L2"
-  5. RAG API called again → pre-filled L2 template shown as-is
+  4. Still broken → Escalate to L2
+  5. RAG L2 call → display ONLY data.content.content
+     rendered as editable table using CSV template fields if uploaded
 
 RAG spec:
   POST /generation/{usecase_id}/{pipeline_id}
   Header : AMToken = <JWT>
   Body   : { "query": "...", "history": [{"question":"...","answer":"..."}] }
+  Answer : response["data"]["content"]["content"]
 
-JWT: OpenAM → SSO tokenId → JWT (expires 30s, auto-refreshes every 25s)
+JWT: OpenAM → SSO tokenId → JWT via tokenTranslator_v2 (30s TTL, auto-refresh 25s)
+
+Install:
+  pip install streamlit requests httpx truststore python-dotenv
+  streamlit run genie_bot_streamlit_poc.py
 """
 
 import csv, io, json, os, ssl, threading, time, uuid
@@ -37,7 +43,7 @@ JWT_VERSION = os.getenv("JWT_VERSION",    "v2")
 VERIFY_TLS  = os.getenv("VERIFY_TLS",    "true").lower() == "true"
 TOKEN_TTL   = 30
 
-RAG_BASE_URL = os.getenv("RAG_BASE_URL",     f"https://{FQDN}")
+RAG_BASE_URL = os.getenv("RAG_BASE_URL",    f"https://{FQDN}")
 RAG_USECASE  = os.getenv("RAG_USECASE_ID",  "")
 RAG_PIPELINE = os.getenv("RAG_PIPELINE_ID", "")
 RAG_TIMEOUT  = int(os.getenv("RAG_TIMEOUT", "60"))
@@ -47,7 +53,9 @@ _JWT_PATHS = {
     "v2": "/dsp/rest-sts/DSP_iB2B/iB2B_tokenTranslator_v2",
 }
 
-# ── Prompts ───────────────────────────────────────────────────────────────
+# ══════════════════════════════════════════════════════════════════════════
+#  PROMPTS
+# ══════════════════════════════════════════════════════════════════════════
 L1_QUERY = """You are a Genie Bot L1 support agent.
 Analyse the error log below using the knowledge base.
 Provide:
@@ -56,13 +64,13 @@ Provide:
 3. Whether it is safe to manually rerun the bot after the fix
 4. SOP reference number if found
 
-If no fix is available in the knowledge base, say clearly that this needs L2 escalation.
+If no fix is available, say clearly that this needs L2 escalation.
 
 ERROR LOG:
 {log}"""
 
 L2_QUERY = """The user tried the L1 fix but the issue persists.
-Using the knowledge base, pre-fill the L2 escalation support ticket for this error.
+Using the knowledge base, pre-fill the L2 escalation support ticket.
 {template_section}
 Previous L1 resolution attempt:
 {l1_answer}
@@ -70,81 +78,138 @@ Previous L1 resolution attempt:
 ERROR LOG:
 {log}"""
 
-def build_l2_query(log: str, l1_answer: str, template_fields: str = "") -> str:
+
+def build_l2_query(log, l1_answer, template_fields=""):
     if template_fields:
-        tmpl_section = (
-            "Fill EXACTLY these fields from the template (do not add or remove fields):\n"
+        section = (
+            "Fill EXACTLY these fields (do not add or remove any, "
+            "output as a markdown table with columns Field | Value | Notes):\n"
             + template_fields + "\n\n"
         )
     else:
-        tmpl_section = (
-            "Include all relevant fields: error summary, affected module, classification, "
-            "priority, root cause, what was already tried, stack trace summary, "
-            "SOP reference, run ID if visible.\n\n"
+        section = (
+            "Include: error summary, affected module, classification, priority, "
+            "root cause, what was tried, stack trace summary, SOP reference, run ID. "
+            "Output as a markdown table: Field | Value | Notes.\n\n"
         )
     return L2_QUERY.format(
-        template_section=tmpl_section,
+        template_section=section,
         l1_answer=l1_answer,
         log=log[:1500],
     )
 
 
 # ══════════════════════════════════════════════════════════════════════════
-#  TEMPLATE CSV LOADER
+#  HELPERS
 # ══════════════════════════════════════════════════════════════════════════
-def load_template_csv(uploaded_file) -> str:
-    """
-    Load your template CSV and return a formatted string of field names + descriptions.
-    This is injected into the L2 RAG query so the model fills YOUR exact fields.
-    Expected CSV columns: field_name, description, example, mandatory
-    (column names are flexible — any two-column CSV works)
-    """
-    try:
-        text   = uploaded_file.read().decode("utf-8", errors="replace")
-        reader = csv.DictReader(io.StringIO(text))
-        rows   = list(reader)
-        if not rows:
-            return ""
-        headers = list(rows[0].keys())
-        lines   = []
-        for row in rows:
-            # Try common column name patterns
-            name  = (row.get("field_name") or row.get("Field Name") or
-                     row.get("field") or row.get("Field") or row.get(headers[0], ""))
-            desc  = (row.get("description") or row.get("Description") or
-                     row.get("desc") or (row.get(headers[1], "") if len(headers) > 1 else ""))
-            mand  = (row.get("mandatory") or row.get("Mandatory") or
-                     row.get("required") or row.get("Required") or "")
-            if name.strip():
-                suffix = " (mandatory)" if str(mand).strip().lower() in ("yes","true","y","1") else ""
-                lines.append(f"- {name.strip()}{suffix}: {desc.strip()}" if desc.strip()
-                             else f"- {name.strip()}{suffix}")
-        return "\n".join(lines)
-    except Exception as e:
-        return f"(Could not parse template CSV: {e})"
-
-
-def fix_newlines(text: str) -> str:
-    """
-    RAG returns escaped \n as literal backslash-n.
-    Convert to real newlines so markdown tables render correctly.
-    """
+def fix_newlines(text):
+    """RAG returns literal backslash-n. Convert to real newlines for markdown."""
     return text.replace("\\n", "\n").replace("\\t", "\t")
 
 
+def extract_content(raw):
+    """Pull answer from data.content.content — your confirmed response path."""
+    try:
+        return raw["data"]["content"]["content"]
+    except (KeyError, TypeError):
+        for key in ("answer", "response", "result", "output", "text"):
+            val = raw.get(key)
+            if val and isinstance(val, str):
+                return val
+        return json.dumps(raw, indent=2)
+
+
+def load_template_csv(uploaded_file):
+    """
+    Parse template CSV -> list of dicts: {field, desc, mandatory}
+    Accepts column names: field_name / Field / field,
+                          description / Description / desc,
+                          mandatory / Mandatory / required
+    """
+    try:
+        text    = uploaded_file.read().decode("utf-8", errors="replace")
+        reader  = csv.DictReader(io.StringIO(text))
+        rows    = list(reader)
+        if not rows:
+            return []
+        headers = list(rows[0].keys())
+        result  = []
+        for row in rows:
+            name = (row.get("field_name") or row.get("Field Name") or
+                    row.get("field")      or row.get("Field")      or
+                    row.get(headers[0], "")).strip()
+            desc = (row.get("description") or row.get("Description") or
+                    row.get("desc")        or
+                    (row.get(headers[1], "") if len(headers) > 1 else "")).strip()
+            mval = (row.get("mandatory") or row.get("Mandatory") or
+                    row.get("required")  or row.get("Required")  or "").strip()
+            mand = mval.lower() in ("yes", "true", "y", "1")
+            if name:
+                result.append({"field": name, "desc": desc, "mandatory": mand})
+        return result
+    except Exception as e:
+        st.error(f"Could not parse template CSV: {e}")
+        return []
+
+
+def parse_markdown_table(text):
+    """
+    Parse a markdown table into {field: {value, note}} dict.
+    Handles: | Section | Field | Value | Notes |
+             | Field | Value |  (simple 2-col)
+    """
+    result, header = {}, []
+    for line in [l.strip() for l in text.splitlines() if l.strip()]:
+        if not line.startswith("|"):
+            continue
+        cells = [c.strip() for c in line.strip("|").split("|")]
+        cells = [c for c in cells if c]
+        if not cells:
+            continue
+        if all(c.replace("-","").replace(":","").replace(" ","") == "" for c in cells):
+            continue   # separator row
+        if not header:
+            header = cells
+            continue
+        if len(cells) < 2:
+            continue
+        fi = next((i for i,h in enumerate(header) if "field" in h.lower()), 1)
+        vi = next((i for i,h in enumerate(header) if "value" in h.lower()), min(2, len(cells)-1))
+        ni = next((i for i,h in enumerate(header) if "note"  in h.lower()), -1)
+        if fi < len(cells) and vi < len(cells):
+            f = cells[fi]
+            if f and f not in ("Field","field","—","-",""):
+                result[f] = {
+                    "value": cells[vi],
+                    "note":  cells[ni] if 0 <= ni < len(cells) else "",
+                }
+    return result
+
+
+def fuzzy_match(field_name, parsed):
+    """Find best value for a field name — case-insensitive contains match."""
+    fn = field_name.lower().strip()
+    for k, v in parsed.items():
+        kl = k.lower()
+        if fn in kl or kl in fn:
+            return v.get("value", "")
+    return ""
+
+
 # ══════════════════════════════════════════════════════════════════════════
-#  AUTH — exact replica of your existing functions
+#  AUTH  — exact replica of your existing code
 # ══════════════════════════════════════════════════════════════════════════
-def translate_sso_to_jwt(fqdn, sso_token, version="v2",
-                          verify_tls=True, timeout=30) -> str:
+def translate_sso_to_jwt(fqdn, sso_token, version="v2", verify_tls=True, timeout=30):
     if version not in _JWT_PATHS:
         raise ValueError("version must be 'v1' or 'v2'")
     resp = requests.post(
         f"https://{fqdn}{_JWT_PATHS[version]}",
         params={"_action": "translate"},
         headers={"Content-Type": "application/json", "Accept": "application/json"},
-        json={"input_token_state":  {"token_type": "SSOTOKEN", "tokenId": sso_token},
-              "output_token_state": {"token_type": "JWT"}},
+        json={
+            "input_token_state":  {"token_type": "SSOTOKEN", "tokenId": sso_token},
+            "output_token_state": {"token_type": "JWT"},
+        },
         timeout=timeout, verify=verify_tls,
     )
     resp.raise_for_status()
@@ -154,29 +219,29 @@ def translate_sso_to_jwt(fqdn, sso_token, version="v2",
     return data["issued_token"]
 
 
-def get_access_token() -> dict:
+def get_access_token():
     resp = requests.post(
         AUTH_URL,
-        headers={"Accept-API-Version": "resource=2.0, protocol=1.0",
-                 "Content-Type": "application/json",
-                 "X-OpenAM-Username": USERNAME,
-                 "X-OpenAM-Password": PASSWORD},
+        headers={
+            "Accept-API-Version": "resource=2.0, protocol=1.0",
+            "Content-Type":       "application/json",
+            "X-OpenAM-Username":  USERNAME,
+            "X-OpenAM-Password":  PASSWORD,
+        },
         json={}, timeout=30, verify=VERIFY_TLS,
     )
     resp.raise_for_status()
     data     = resp.json()
     token_id = data.get("tokenId") or data.get("tokenid", "")
-    return {"jwt": translate_sso_to_jwt(FQDN, token_id,
-                                        version=JWT_VERSION,
-                                        verify_tls=VERIFY_TLS)}
+    return {"jwt": translate_sso_to_jwt(FQDN, token_id, version=JWT_VERSION, verify_tls=VERIFY_TLS)}
 
 
-def get_token() -> str:
+def get_token():
     return get_access_token().get("jwt", "")
 
 
 # ══════════════════════════════════════════════════════════════════════════
-#  JWT MANAGER — background refresh every 25s
+#  JWT MANAGER — background refresh every 25s (token expires at 30s)
 # ══════════════════════════════════════════════════════════════════════════
 class JWTManager:
     def __init__(self):
@@ -216,11 +281,9 @@ class JWTManager:
         try:
             tok = get_token()
             with self._lock:
-                self._token = tok
-                self._expires_at = time.time() + TOKEN_TTL
+                self._token = tok; self._expires_at = time.time() + TOKEN_TTL
                 self.last_refresh = datetime.now(timezone.utc).strftime("%H:%M:%S UTC")
-                self.last_error   = ""
-                self.refresh_count += 1
+                self.last_error = ""; self.refresh_count += 1
         except Exception as e:
             with self._lock: self.last_error = str(e)
 
@@ -228,43 +291,23 @@ class JWTManager:
 # ══════════════════════════════════════════════════════════════════════════
 #  RAG API
 # ══════════════════════════════════════════════════════════════════════════
-def rag_url() -> str:
+def rag_url():
     return f"{RAG_BASE_URL.rstrip('/')}/generation/{RAG_USECASE}/{RAG_PIPELINE}"
 
 
-def call_rag(query: str, jwt: str, history: list) -> tuple[str, dict]:
+def call_rag(query, jwt, history):
     """
-    POST to RAG endpoint.
-    Returns (answer_text, full_raw_response).
+    POST to RAG. Returns (data.content.content text, full raw response).
     """
     resp = requests.post(
         rag_url(),
-        headers={"Content-Type": "application/json",
-                 "Accept":       "application/json",
-                 "AMToken":      jwt},
+        headers={"Content-Type":"application/json","Accept":"application/json","AMToken":jwt},
         json={"query": query, "history": history},
         timeout=RAG_TIMEOUT, verify=VERIFY_TLS,
     )
     resp.raise_for_status()
     raw = resp.json()
-
-    # Extract answer from your confirmed response shape:
-    # { "code": 0, "msg": "success",
-    #   "data": { "content": { "content": "<answer text>", ... } } }
-    try:
-        answer = raw["data"]["content"]["content"]
-    except (KeyError, TypeError):
-        # Fallback for any other shape
-        answer = ""
-        for key in ("answer", "response", "result", "output", "text"):
-            val = raw.get(key)
-            if val and isinstance(val, str):
-                answer = val
-                break
-        if not answer:
-            answer = json.dumps(raw, indent=2)
-
-    return answer, raw
+    return extract_content(raw), raw
 
 
 # ══════════════════════════════════════════════════════════════════════════
@@ -275,41 +318,23 @@ st.set_page_config(page_title="Genie Bot AI Support", page_icon="🤖",
 
 st.markdown("""
 <style>
-  .block-container { padding-top: 1.2rem; }
-  .stTextArea textarea { font-family: monospace; font-size: 12px; }
-  .l1box {
-    background: #f0fdf4; border-left: 4px solid #16a34a;
-    border-radius: 6px; padding: 18px 22px; margin: 12px 0;
-  }
-  .l2box {
-    background: #eff6ff; border-left: 4px solid #2563eb;
-    border-radius: 6px; padding: 18px 22px; margin: 12px 0;
-  }
-  .stepbox {
-    background: #fafafa; border: 1px solid #e5e7eb;
-    border-radius: 6px; padding: 12px 16px; margin: 8px 0;
-    font-size: 13px;
-  }
-  .specbox {
-    background: #f8fafc; border: 1px solid #e2e8f0;
-    border-radius: 6px; padding: 10px 14px;
-    font-family: monospace; font-size: 11px; line-height: 1.7;
-  }
+  .block-container{padding-top:1.2rem}
+  .stTextArea textarea{font-family:monospace;font-size:12px}
+  .l1box{background:#f0fdf4;border-left:4px solid #16a34a;border-radius:6px;padding:18px 22px;margin:12px 0}
+  .l2box{background:#eff6ff;border-left:4px solid #2563eb;border-radius:6px;padding:14px 18px;margin:12px 0}
+  .stepbox{background:#fafafa;border:1px solid #e5e7eb;border-radius:6px;padding:12px 16px;margin:8px 0}
+  .specbox{background:#f8fafc;border:1px solid #e2e8f0;border-radius:6px;padding:10px 14px;font-family:monospace;font-size:11px;line-height:1.7}
+  .tbl-hdr{background:#1e3a5f;color:white;padding:8px 12px;border-radius:6px 6px 0 0;font-weight:700;font-size:13px;display:grid;grid-template-columns:200px 1fr;gap:8px;margin-bottom:4px}
 </style>
 """, unsafe_allow_html=True)
 
-# ── Session state ──────────────────────────────────────────────────────────
+# Session state
 for k, v in {
-    "jwt_manager":  None,
-    "jwt_started":  False,
-    "stage":        "idle",      # idle | l1_done | l2_done
-    "log_text":     "",
-    "l1_answer":    "",          # raw text answer from RAG for L1
-    "l1_raw_resp":  None,        # full RAG JSON for L1
-    "l2_answer":    "",          # raw text answer from RAG for L2
-    "l2_raw_resp":  None,        # full RAG JSON for L2
-    "rag_history":  [],          # conversation history sent to RAG
-    "template_fields": "",       # field list loaded from CSV upload
+    "jwt_manager": None, "jwt_started": False,
+    "stage": "idle", "log_text": "",
+    "l1_answer": "", "l1_raw_resp": None,
+    "l2_answer": "", "l2_raw_resp": None,
+    "rag_history": [], "template_rows": [],
 }.items():
     if k not in st.session_state: st.session_state[k] = v
 
@@ -318,430 +343,272 @@ if st.session_state.jwt_manager is None:
 
 jm: JWTManager = st.session_state.jwt_manager
 
-# ══════════════════════════════════════════════════════════════════════════
-#  SIDEBAR
-# ══════════════════════════════════════════════════════════════════════════
+# ── SIDEBAR ───────────────────────────────────────────────────────────────
 with st.sidebar:
     st.markdown("## ⚙️ Setup")
 
-    # Endpoint info
     st.markdown("### 🔌 RAG Endpoint")
     st.markdown(f"""<div class="specbox">
-<b>POST</b> {rag_url() or '⚠ Configure env vars'}<br/><br/>
-<b>Header</b>: AMToken: &lt;JWT&gt;<br/><br/>
-<b>Body</b>:<br/>
-{{"query": "...",<br/>
-&nbsp;"history": [{{"question":"...","answer":"..."}}]}}<br/><br/>
-<b>Auth</b>: {AUTH_URL or '⚠ AUTH_URL not set'} → v{JWT_VERSION}
+<b>POST</b> {rag_url() or '⚠ Set env vars'}<br/><br/>
+<b>Header</b>: AMToken: &lt;JWT&gt;<br/>
+<b>Answer</b>: data → content → content<br/><br/>
+<b>Auth</b>: {AUTH_URL or '⚠ not set'} → v{JWT_VERSION}
 </div>""", unsafe_allow_html=True)
 
     st.divider()
+    st.markdown("### 🔐 JWT  `30s TTL`")
 
-    # JWT
-    st.markdown(f"### 🔐 JWT  `30s TTL`")
     if not st.session_state.jwt_started:
+        st.info("JWT sent as `AMToken` header on every RAG call.")
         if st.button("▶ Start JWT", type="primary", use_container_width=True):
             with st.spinner("OpenAM → SSO → JWT…"):
                 try:
-                    jm.start()
-                    st.session_state.jwt_started = True
-                    st.rerun()
+                    jm.start(); st.session_state.jwt_started = True; st.rerun()
                 except Exception as e:
                     st.error(f"Auth failed: {e}")
     else:
         secs = jm.seconds_remaining
-        c = "🟢" if secs > 10 else "🟡"
-        st.success(f"{c} Active — **{secs}s** left") if jm.is_valid else st.error("🔴 Expired")
-
+        icon = "🟢" if secs > 10 else "🟡"
+        st.success(f"{icon} Active — **{secs}s** left") if jm.is_valid else st.error("🔴 Expired")
         c1, c2 = st.columns(2)
-        if c1.button("🔄 Refresh", use_container_width=True):
-            jm.refresh(); st.rerun()
-        if c2.button("⏹ Stop", use_container_width=True):
+        if c1.button("🔄 Refresh", use_container_width=True): jm.refresh(); st.rerun()
+        if c2.button("⏹ Stop",    use_container_width=True):
             jm.stop(); st.session_state.jwt_started = False; st.rerun()
-
         st.caption(f"Last: {jm.last_refresh}  |  #{jm.refresh_count}")
         if jm.last_error: st.error(f"⚠ {jm.last_error[:100]}")
         if jm.token:
-            tok = jm.token
-            st.code(tok[:16] + "…" + tok[-6:], language=None)
-        st.caption(f"Auto-refreshes every {TOKEN_TTL - 5}s")
-
-    st.divider()
-
-    # Reset
-    if st.button("🔄 Start Over", use_container_width=True):
-        for k in ["stage","log_text","l1_answer","l1_raw_resp",
-                  "l2_answer","l2_raw_resp","rag_history"]:
-            st.session_state[k] = [] if k == "rag_history" else (None if "resp" in k else "")
-        st.session_state.stage = "idle"
-        st.rerun()
-
-    # Response path confirmed: raw["data"]["content"]["content"]
-    st.divider()
-    st.markdown("### 🔎 Response path")
-    st.caption("`data → content → content`")
+            tok = jm.token; st.code(tok[:16]+"…"+tok[-6:], language=None)
+        st.caption(f"Auto-refreshes every {TOKEN_TTL-5}s")
 
     st.divider()
     st.markdown("### 📄 L2 Template CSV *(optional)*")
-    st.caption("Upload your template CSV to make the RAG fill your exact fields.")
-    tmpl_upload = st.file_uploader(
-        "Upload template CSV", type=["csv"], key="tmpl_csv_upload",
-        help="Columns: field_name, description, mandatory (column names flexible)"
-    )
-    if tmpl_upload:
-        fields = load_template_csv(tmpl_upload)
-        st.session_state.template_fields = fields
-        st.success(f"✅ {len(fields.splitlines())} fields loaded")
-        with st.expander("Preview fields"):
-            st.text(fields)
-    elif not st.session_state.get("template_fields"):
-        st.caption("No CSV uploaded — RAG will use default fields")
+    st.caption("Upload your template CSV so RAG fills **your exact fields**.\nColumns: `field_name`, `description`, `mandatory`")
+    tmpl_file = st.file_uploader("Upload template CSV", type=["csv"], key="tmpl_up")
+    if tmpl_file:
+        rows = load_template_csv(tmpl_file)
+        if rows:
+            st.session_state.template_rows = rows
+            st.success(f"✅ {len(rows)} fields loaded")
+            with st.expander("Preview"):
+                for r in rows:
+                    st.caption(f"{'🔴' if r['mandatory'] else '·'} {r['field']}")
+    elif not st.session_state.template_rows:
+        st.caption("No CSV — RAG will use default fields")
+
+    st.divider()
+    if st.button("🔄 Start Over", use_container_width=True):
+        for k in ["stage","log_text","l1_answer","l1_raw_resp","l2_answer","l2_raw_resp","rag_history"]:
+            st.session_state[k] = [] if k=="rag_history" else (None if "resp" in k else "")
+        st.session_state.stage = "idle"; st.rerun()
     st.divider()
     st.caption("🔒 Genie Bot AI Copilot · PoC")
 
 
-# ══════════════════════════════════════════════════════════════════════════
-#  MAIN PANEL
-# ══════════════════════════════════════════════════════════════════════════
+# ── MAIN ──────────────────────────────────────────────────────────────────
 st.title("🤖 Genie Bot AI Support Copilot")
-st.caption(
-    f"`POST /generation/{RAG_USECASE}/{RAG_PIPELINE}`  "
-    f"| Auth: `AMToken` header"
-)
+st.caption(f"`POST /generation/{RAG_USECASE}/{RAG_PIPELINE}`  |  Auth: `AMToken`  |  Answer: `data.content.content`")
 
-# ── STAGE: IDLE — show log input ──────────────────────────────────────────
+# ══════════ STAGE: idle ═══════════════════════════════════════════════════
 if st.session_state.stage == "idle":
 
     if not st.session_state.jwt_started:
         st.info("👈 Start the JWT manager from the sidebar to begin.")
 
     tab_paste, tab_upload = st.tabs(["📋 Paste Log", "📁 Upload File"])
+    log_input = ""
 
     with tab_paste:
-        log_input = st.text_area(
-            "Paste Genie Bot error log",
-            height=240,
+        log_input = st.text_area("Paste Genie Bot error log", height=240,
             placeholder=(
                 "[2026-05-27 09:14:32 UTC] RUN_ID=GBT-20260527-0042 ENV=PROD\n"
                 "[ERROR] Module: TradeDataExtractor | Exit: FAILED\n"
                 "[ERROR] System.NullReferenceException: Object reference not set\n"
-                "   at GeniBot.Core.DataExtractor.Execute() line 142\n"
-                "[INPUT] Entity=GBCIB | ReportDate=2026-05-27"
-            ),
-            key="log_paste_input",
-        )
+                "   at GeniBot.Core.DataExtractor.Execute() line 142"
+            ), key="paste_input")
 
     with tab_upload:
-        uploaded = st.file_uploader("Upload .log / .txt", type=["log", "txt"])
-        log_input = ""
-        if uploaded:
-            log_input = uploaded.read().decode("utf-8", errors="replace")
-            st.text_area("Preview",
-                         value=log_input[:600] + ("…" if len(log_input) > 600 else ""),
+        up = st.file_uploader("Upload .log / .txt", type=["log","txt"])
+        if up:
+            log_input = up.read().decode("utf-8", errors="replace")
+            st.text_area("Preview", value=log_input[:600]+("…" if len(log_input)>600 else ""),
                          height=140, disabled=True)
         else:
-            log_input = st.session_state.get("log_paste_input", "")
+            log_input = st.session_state.get("paste_input","")
 
     ready = st.session_state.jwt_started and jm.is_valid
-    btn   = st.button("🔍 Diagnose Issue", type="primary",
-                       use_container_width=True, disabled=not ready)
-    if not ready:
-        st.caption("⚠ Start JWT manager first" if not st.session_state.jwt_started
-                   else "⚠ JWT expired — refresh in sidebar")
-
-    if btn:
+    if st.button("🔍 Diagnose Issue", type="primary", use_container_width=True, disabled=not ready):
         if not log_input.strip():
-            st.warning("Please paste or upload an error log first.")
+            st.warning("Please paste or upload a log first.")
         elif not RAG_USECASE or not RAG_PIPELINE:
-            st.error("Set RAG_USECASE_ID and RAG_PIPELINE_ID in your .env file.")
+            st.error("Set RAG_USECASE_ID and RAG_PIPELINE_ID in .env")
         else:
-            with st.spinner(f"🤖 Calling RAG API for L1 resolution…"):
+            with st.spinner("🤖 Calling RAG API for L1 triage…"):
                 try:
-                    query   = L1_QUERY.format(log=log_input[:2500])
-                    answer, raw = call_rag(query, jm.token, [])
-
+                    q = L1_QUERY.format(log=log_input[:2500])
+                    ans, raw = call_rag(q, jm.token, [])
                     st.session_state.log_text    = log_input
-                    st.session_state.l1_answer   = answer
+                    st.session_state.l1_answer   = ans
                     st.session_state.l1_raw_resp = raw
-                    # Save this turn to history for the L2 call
-                    st.session_state.rag_history = [
-                        {"question": query, "answer": answer}
-                    ]
-                    st.session_state.stage = "l1_done"
+                    st.session_state.rag_history = [{"question":q,"answer":ans}]
+                    st.session_state.stage       = "l1_done"
                     st.rerun()
                 except requests.HTTPError as e:
-                    st.error(f"RAG API {e.response.status_code}: {e.response.text[:300]}")
+                    st.error(f"RAG {e.response.status_code}: {e.response.text[:300]}")
                 except Exception as e:
                     st.error(f"Call failed: {e}")
 
+    if not ready:
+        st.caption("⚠ Start JWT first" if not st.session_state.jwt_started
+                   else "⚠ JWT expired — refresh in sidebar")
 
-# ── STAGE: L1 DONE — show L1 resolution + Escalate button ─────────────────
+
+# ══════════ STAGE: l1_done ════════════════════════════════════════════════
 elif st.session_state.stage == "l1_done":
 
-    st.markdown("### 📋 Error Log")
-    with st.expander("View submitted log", expanded=False):
+    with st.expander("📋 Submitted log", expanded=False):
         st.code(st.session_state.log_text, language="text")
 
     st.markdown("---")
 
-    # L1 answer — show exactly as received from RAG
+    # L1 — display ONLY data.content.content, newlines fixed
     st.markdown('<div class="l1box">', unsafe_allow_html=True)
     st.markdown("### ✅ L1 Resolution")
-    st.caption("From RAG knowledge base — review the steps below and try the fix manually")
+    st.caption("From RAG knowledge base · Try the fix below manually")
     st.markdown(fix_newlines(st.session_state.l1_answer))
     st.markdown("</div>", unsafe_allow_html=True)
 
     st.markdown("---")
+    st.markdown('<div class="stepbox"><b>After trying the fix above:</b></div>',
+                unsafe_allow_html=True)
 
-    # User decision
-    st.markdown('<div class="stepbox">', unsafe_allow_html=True)
-    st.markdown("**After trying the fix above:**")
-    st.markdown("</div>", unsafe_allow_html=True)
+    col_ok, col_esc = st.columns(2)
 
-    col_fixed, col_escalate = st.columns(2)
-
-    with col_fixed:
+    with col_ok:
         if st.button("✅ Fix Worked — Log as Resolved",
                      use_container_width=True, type="primary"):
-            st.success(
-                "✅ Great! Issue resolved. "
-                "Wire your Jira agent here to auto-create a DONE ticket."
-            )
+            st.success("✅ Issue resolved! Wire your Jira agent here to create a DONE ticket.")
 
-    with col_escalate:
-        escalate_ready = st.session_state.jwt_started and jm.is_valid
+    with col_esc:
+        can_esc = st.session_state.jwt_started and jm.is_valid
         if st.button("🔴 Still Broken — Escalate to L2",
-                     use_container_width=True, disabled=not escalate_ready):
+                     use_container_width=True, disabled=not can_esc):
+            # Build template field string from CSV rows
+            tmpl_rows = st.session_state.template_rows
+            tmpl_str  = ""
+            if tmpl_rows:
+                lines = []
+                for r in tmpl_rows:
+                    suf  = " (mandatory)" if r["mandatory"] else ""
+                    line = f"- {r['field']}{suf}"
+                    if r["desc"]: line += f": {r['desc']}"
+                    lines.append(line)
+                tmpl_str = "\n".join(lines)
+
             with st.spinner("📋 Calling RAG API for L2 escalation template…"):
                 try:
-                    query = build_l2_query(
+                    q = build_l2_query(
                         log=st.session_state.log_text,
                         l1_answer=st.session_state.l1_answer,
-                        template_fields=st.session_state.get("template_fields", ""),
+                        template_fields=tmpl_str,
                     )
-                    answer, raw = call_rag(
-                        query, jm.token,
-                        st.session_state.rag_history,   # L1 turn as history
-                    )
-
-                    st.session_state.l2_answer   = answer
+                    ans, raw = call_rag(q, jm.token, st.session_state.rag_history)
+                    st.session_state.l2_answer   = ans
                     st.session_state.l2_raw_resp = raw
-                    # Append L2 turn to history
-                    st.session_state.rag_history.append(
-                        {"question": query, "answer": answer}
-                    )
-                    st.session_state.stage = "l2_done"
+                    st.session_state.rag_history.append({"question":q,"answer":ans})
+                    st.session_state.stage       = "l2_done"
                     st.rerun()
                 except requests.HTTPError as e:
-                    st.error(f"RAG API {e.response.status_code}: {e.response.text[:300]}")
+                    st.error(f"RAG {e.response.status_code}: {e.response.text[:300]}")
                 except Exception as e:
                     st.error(f"Call failed: {e}")
 
     st.markdown("---")
-
-    # Debug — show only data.content.content
-    with st.expander("🔧 RAG response · data.content.content (L1)", expanded=False):
+    # Debug — ONLY data.content.content
+    with st.expander("🔧 RAG response — data.content.content (L1)", expanded=False):
         try:
             st.text(st.session_state.l1_raw_resp["data"]["content"]["content"])
         except Exception:
             st.json(st.session_state.l1_raw_resp)
 
 
-# ── STAGE: L2 DONE — show L2 template exactly as returned by RAG ──────────
+# ══════════ STAGE: l2_done ════════════════════════════════════════════════
 elif st.session_state.stage == "l2_done":
 
-    st.markdown("### 📋 Error Log")
-    with st.expander("View submitted log", expanded=False):
+    with st.expander("📋 Submitted log", expanded=False):
         st.code(st.session_state.log_text, language="text")
 
-    st.markdown("---")
-
-    # L1 summary (collapsed)
     with st.expander("✅ L1 Resolution that was attempted", expanded=False):
         st.markdown(fix_newlines(st.session_state.l1_answer))
 
     st.markdown("---")
 
-    # ── L2 editable table ─────────────────────────────────────────────────
     st.markdown('<div class="l2box">', unsafe_allow_html=True)
-    st.markdown("### 📋 L2 Escalation Template — Pre-filled")
-    st.caption("Every field is editable · review · add comments · then submit")
+    st.markdown("### 📋 L2 Escalation Template — Pre-filled by RAG")
+    st.caption("All fields are editable · Review · add comments · then submit")
     st.markdown("</div>", unsafe_allow_html=True)
 
-    # Parse the L2 answer into field → value pairs.
-    # Strategy (in order):
-    #   A) If user uploaded a template CSV → use those field names as row headers,
-    #      extract the matching values from the RAG markdown table
-    #   B) If no CSV → parse the RAG markdown table rows directly
-    #   C) Fallback → show a single editable text area
+    # L2 answer: ONLY data.content.content, newlines fixed
+    raw_answer = fix_newlines(st.session_state.l2_answer)
 
-    raw_answer  = fix_newlines(st.session_state.l2_answer)
-    tmpl_fields = st.session_state.get("template_fields", "")
+    # Parse the markdown table returned by RAG
+    parsed     = parse_markdown_table(raw_answer)
+    tmpl_rows  = st.session_state.template_rows
 
-    def parse_markdown_table(text: str) -> dict:
-        """
-        Parse a markdown table of the form:
-          | Section | Field | Value | Notes |
-          |---------|-------|-------|-------|
-          | Routing | Suspected owner | ICE/vendor | ... |
-        Returns dict of {field: value} keeping the last column with real content.
-        Also handles simpler | Field | Value | tables.
-        """
-        rows = {}
-        lines = [l.strip() for l in text.splitlines() if l.strip()]
-        header = []
-        for line in lines:
-            if not line.startswith("|"):
-                continue
-            cells = [c.strip() for c in line.strip("|").split("|")]
-            cells = [c for c in cells if c]  # drop empty
-            if not cells:
-                continue
-            # Skip separator rows (--- lines)
-            if all(set(c.replace("-","").replace(":","").replace(" ","")) <= set() for c in cells):
-                continue
-            if all(c.replace("-","").replace(":","").strip() == "" for c in cells):
-                continue
-            # First real row = header
-            if not header:
-                header = cells
-                continue
-            if len(cells) < 2:
-                continue
-            # Try to find Field and Value columns from header
-            field_idx = next((i for i,h in enumerate(header)
-                              if "field" in h.lower()), 1)
-            val_idx   = next((i for i,h in enumerate(header)
-                              if "value" in h.lower()), min(2, len(cells)-1))
-            note_idx  = next((i for i,h in enumerate(header)
-                              if "note" in h.lower()), -1)
-            if field_idx < len(cells) and val_idx < len(cells):
-                field = cells[field_idx]
-                value = cells[val_idx]
-                note  = cells[note_idx] if note_idx >= 0 and note_idx < len(cells) else ""
-                if field and field not in ("Field","field","—","-"):
-                    rows[field] = {"value": value, "note": note}
-        return rows
-
-    def match_value(field_name: str, parsed: dict) -> str:
-        """Case-insensitive fuzzy match of field name → parsed table value."""
-        fn = field_name.lower().strip()
-        for k, v in parsed.items():
-            if fn in k.lower() or k.lower() in fn:
-                return v.get("value","")
-        return ""
-
-    # Parse the RAG markdown table
-    parsed_table = parse_markdown_table(raw_answer)
-
-    # Build the display rows
-    if tmpl_fields:
-        # Use uploaded CSV fields as the row structure
-        display_rows = []
-        for line in tmpl_fields.splitlines():
-            line = line.strip().lstrip("-").strip()
-            if not line: continue
-            # line format: "Field Name (mandatory): description"
-            if ":" in line:
-                fname, desc = line.split(":", 1)
-                fname = fname.replace("(mandatory)","").strip()
-                desc  = desc.strip()
-            else:
-                fname = line; desc = ""
-            is_mand = "(mandatory)" in line.lower()
-            prefill = match_value(fname, parsed_table)
-            display_rows.append({
-                "field": fname, "desc": desc,
-                "mandatory": is_mand, "value": prefill
-            })
-    elif parsed_table:
-        # Use the parsed RAG table rows
+    if tmpl_rows:
+        # Use CSV template rows as structure, fill values from parsed RAG table
+        display_rows = [
+            {"field": r["field"], "desc": r["desc"], "mandatory": r["mandatory"],
+             "value": fuzzy_match(r["field"], parsed)}
+            for r in tmpl_rows
+        ]
+    elif parsed:
+        # Use rows from the RAG markdown table directly
         display_rows = [
             {"field": k, "desc": v.get("note",""), "mandatory": False, "value": v.get("value","")}
-            for k, v in parsed_table.items()
+            for k, v in parsed.items()
         ]
     else:
-        display_rows = []  # fallback
+        display_rows = []
 
     filled = {}
+
     if display_rows:
-        # Render as editable form with Field | Pre-filled Value layout
-        st.markdown("""
-<style>
-.tbl-hdr{display:grid;grid-template-columns:220px 1fr;gap:8px;
-         background:#1e3a5f;color:white;padding:8px 12px;border-radius:6px 6px 0 0;
-         font-weight:700;font-size:13px;margin-bottom:2px}
-.tbl-row{display:grid;grid-template-columns:220px 1fr;gap:8px;
-         align-items:center;padding:4px 0}
-.tbl-field{font-size:12px;font-weight:600;color:#1e3a5f;padding:4px 0}
-.tbl-mand{color:#dc2626;font-size:10px}
-.tbl-desc{font-size:10px;color:#6b7280;margin-top:1px}
-</style>
-""", unsafe_allow_html=True)
-
-        st.markdown('<div class="tbl-hdr"><div>Field</div><div>Pre-filled Value (editable)</div></div>',
-                    unsafe_allow_html=True)
-
+        # Table header
+        st.markdown(
+            '<div class="tbl-hdr"><div>Field</div><div>Pre-filled Value (editable)</div></div>',
+            unsafe_allow_html=True
+        )
         for row in display_rows:
-            fname   = row["field"]
-            mand    = row["mandatory"]
-            desc    = row["desc"]
-            prefill = row["value"]
-
-            col_lbl, col_val = st.columns([2, 4])
-            with col_lbl:
-                star = " 🔴" if mand else ""
-                st.markdown(
-                    f"**{fname}**{star}",
-                    help=desc if desc else None,
-                )
-                if desc:
-                    st.caption(desc[:60])
-            with col_val:
+            fname, mand, desc, prefill = row["field"], row["mandatory"], row["desc"], row["value"]
+            c_lbl, c_val = st.columns([2, 5])
+            with c_lbl:
+                st.markdown(f"**{fname}**" + (" 🔴" if mand else ""), help=desc or None)
+                if desc: st.caption(desc[:70])
+            with c_val:
                 filled[fname] = st.text_area(
-                    label=f"val_{fname}",
-                    value=prefill,
-                    height=60,
-                    key=f"field_{fname}",
-                    label_visibility="collapsed",
+                    fname, value=prefill, height=60,
+                    key=f"l2_{fname}", label_visibility="collapsed"
                 )
-
-        st.markdown("---")
-        col_a, col_b = st.columns([3,1])
-        extra = col_a.text_area(
-            "Additional Comments *(optional)*",
-            height=68, key="extra_comments",
-            placeholder="e.g. This started after the deployment on Friday…"
-        )
-        if extra: filled["Additional Comments"] = extra
-
     else:
-        # Fallback: RAG returned free-text, not a markdown table
+        # Fallback — RAG returned free text not a table
         st.caption("RAG returned free-text — edit below:")
-        filled["content"] = st.text_area(
-            "L2 Template Content",
-            value=raw_answer, height=320, key="l2_freetext",
-        )
-        extra = st.text_area(
-            "Additional Comments *(optional)*",
-            height=68, key="extra_comments",
-            placeholder="e.g. This started after the deployment on Friday…"
-        )
-        if extra: filled["Additional Comments"] = extra
+        filled["content"] = st.text_area("L2 Content", value=raw_answer,
+                                          height=340, key="l2_freetext")
 
     st.markdown("---")
-    col_sub, col_exp = st.columns(2)
-    if col_sub.button("🚀 Submit to L2 Support Team",
-                      type="primary", use_container_width=True):
-        st.success(
-            "✅ Ticket submitted to L2 queue. "
-            "Wire your Jira agent here to create the ticket automatically."
-        )
-    if col_exp.button("📋 Export as JSON", use_container_width=True):
-        st.code(__import__("json").dumps(filled, indent=2), language="json")
+    extra = st.text_area("Additional Comments *(optional)*", height=72, key="extra_cmts",
+                          placeholder="e.g. This started after the deployment on Friday…")
+    if extra: filled["Additional Comments"] = extra
 
-    # Debug — show only data.content.content
-    with st.expander("🔧 RAG response · data.content.content (L2)", expanded=False):
+    c_sub, c_exp = st.columns(2)
+    if c_sub.button("🚀 Submit to L2 Support Team", type="primary", use_container_width=True):
+        st.success("✅ Ticket submitted to L2 queue. Wire your Jira agent here.")
+    if c_exp.button("📋 Export as JSON", use_container_width=True):
+        st.code(json.dumps(filled, indent=2), language="json")
+
+    st.markdown("---")
+    # Debug — ONLY data.content.content
+    with st.expander("🔧 RAG response — data.content.content (L2)", expanded=False):
         try:
             st.text(st.session_state.l2_raw_resp["data"]["content"]["content"])
         except Exception:
