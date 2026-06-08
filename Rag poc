@@ -17,7 +17,7 @@ RAG spec:
 JWT: OpenAM → SSO tokenId → JWT (expires 30s, auto-refreshes every 25s)
 """
 
-import json, os, ssl, threading, time, uuid
+import csv, io, json, os, ssl, threading, time, uuid
 from datetime import datetime, timezone
 from typing import Optional
 
@@ -61,16 +61,75 @@ If no fix is available in the knowledge base, say clearly that this needs L2 esc
 ERROR LOG:
 {log}"""
 
-L2_QUERY = """The user tried the L1 fix but the issue persists. 
+L2_QUERY = """The user tried the L1 fix but the issue persists.
 Using the knowledge base, pre-fill the L2 escalation support ticket for this error.
-Include all relevant fields: error summary, affected module, classification, priority,
-root cause, what was already tried, stack trace summary, SOP reference, run ID if visible.
-
+{template_section}
 Previous L1 resolution attempt:
 {l1_answer}
 
 ERROR LOG:
 {log}"""
+
+def build_l2_query(log: str, l1_answer: str, template_fields: str = "") -> str:
+    if template_fields:
+        tmpl_section = (
+            "Fill EXACTLY these fields from the template (do not add or remove fields):\n"
+            + template_fields + "\n\n"
+        )
+    else:
+        tmpl_section = (
+            "Include all relevant fields: error summary, affected module, classification, "
+            "priority, root cause, what was already tried, stack trace summary, "
+            "SOP reference, run ID if visible.\n\n"
+        )
+    return L2_QUERY.format(
+        template_section=tmpl_section,
+        l1_answer=l1_answer,
+        log=log[:1500],
+    )
+
+
+# ══════════════════════════════════════════════════════════════════════════
+#  TEMPLATE CSV LOADER
+# ══════════════════════════════════════════════════════════════════════════
+def load_template_csv(uploaded_file) -> str:
+    """
+    Load your template CSV and return a formatted string of field names + descriptions.
+    This is injected into the L2 RAG query so the model fills YOUR exact fields.
+    Expected CSV columns: field_name, description, example, mandatory
+    (column names are flexible — any two-column CSV works)
+    """
+    try:
+        text   = uploaded_file.read().decode("utf-8", errors="replace")
+        reader = csv.DictReader(io.StringIO(text))
+        rows   = list(reader)
+        if not rows:
+            return ""
+        headers = list(rows[0].keys())
+        lines   = []
+        for row in rows:
+            # Try common column name patterns
+            name  = (row.get("field_name") or row.get("Field Name") or
+                     row.get("field") or row.get("Field") or row.get(headers[0], ""))
+            desc  = (row.get("description") or row.get("Description") or
+                     row.get("desc") or (row.get(headers[1], "") if len(headers) > 1 else ""))
+            mand  = (row.get("mandatory") or row.get("Mandatory") or
+                     row.get("required") or row.get("Required") or "")
+            if name.strip():
+                suffix = " (mandatory)" if str(mand).strip().lower() in ("yes","true","y","1") else ""
+                lines.append(f"- {name.strip()}{suffix}: {desc.strip()}" if desc.strip()
+                             else f"- {name.strip()}{suffix}")
+        return "\n".join(lines)
+    except Exception as e:
+        return f"(Could not parse template CSV: {e})"
+
+
+def fix_newlines(text: str) -> str:
+    """
+    RAG returns escaped \n as literal backslash-n.
+    Convert to real newlines so markdown tables render correctly.
+    """
+    return text.replace("\\n", "\n").replace("\\t", "\t")
 
 
 # ══════════════════════════════════════════════════════════════════════════
@@ -250,6 +309,7 @@ for k, v in {
     "l2_answer":    "",          # raw text answer from RAG for L2
     "l2_raw_resp":  None,        # full RAG JSON for L2
     "rag_history":  [],          # conversation history sent to RAG
+    "template_fields": "",       # field list loaded from CSV upload
 }.items():
     if k not in st.session_state: st.session_state[k] = v
 
@@ -320,6 +380,22 @@ with st.sidebar:
     st.divider()
     st.markdown("### 🔎 Response path")
     st.caption("`data → content → content`")
+
+    st.divider()
+    st.markdown("### 📄 L2 Template CSV *(optional)*")
+    st.caption("Upload your template CSV to make the RAG fill your exact fields.")
+    tmpl_upload = st.file_uploader(
+        "Upload template CSV", type=["csv"], key="tmpl_csv_upload",
+        help="Columns: field_name, description, mandatory (column names flexible)"
+    )
+    if tmpl_upload:
+        fields = load_template_csv(tmpl_upload)
+        st.session_state.template_fields = fields
+        st.success(f"✅ {len(fields.splitlines())} fields loaded")
+        with st.expander("Preview fields"):
+            st.text(fields)
+    elif not st.session_state.get("template_fields"):
+        st.caption("No CSV uploaded — RAG will use default fields")
     st.divider()
     st.caption("🔒 Genie Bot AI Copilot · PoC")
 
@@ -412,7 +488,7 @@ elif st.session_state.stage == "l1_done":
     st.markdown('<div class="l1box">', unsafe_allow_html=True)
     st.markdown("### ✅ L1 Resolution")
     st.caption("From RAG knowledge base — review the steps below and try the fix manually")
-    st.markdown(st.session_state.l1_answer)
+    st.markdown(fix_newlines(st.session_state.l1_answer))
     st.markdown("</div>", unsafe_allow_html=True)
 
     st.markdown("---")
@@ -438,9 +514,10 @@ elif st.session_state.stage == "l1_done":
                      use_container_width=True, disabled=not escalate_ready):
             with st.spinner("📋 Calling RAG API for L2 escalation template…"):
                 try:
-                    query = L2_QUERY.format(
+                    query = build_l2_query(
+                        log=st.session_state.log_text,
                         l1_answer=st.session_state.l1_answer,
-                        log=st.session_state.log_text[:1500],
+                        template_fields=st.session_state.get("template_fields", ""),
                     )
                     answer, raw = call_rag(
                         query, jm.token,
@@ -478,7 +555,7 @@ elif st.session_state.stage == "l2_done":
 
     # L1 summary (collapsed)
     with st.expander("✅ L1 Resolution that was attempted", expanded=False):
-        st.markdown(st.session_state.l1_answer)
+        st.markdown(fix_newlines(st.session_state.l1_answer))
 
     st.markdown("---")
 
@@ -486,7 +563,7 @@ elif st.session_state.stage == "l2_done":
     st.markdown('<div class="l2box">', unsafe_allow_html=True)
     st.markdown("### 📋 L2 Escalation Template")
     st.caption("Pre-filled by RAG pipeline · Review · add comments · then submit")
-    st.markdown(st.session_state.l2_answer)
+    st.markdown(fix_newlines(st.session_state.l2_answer))
     st.markdown("</div>", unsafe_allow_html=True)
 
     st.markdown("---")
