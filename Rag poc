@@ -1,41 +1,27 @@
 """
-genie_bot_streamlit_poc.py
-==========================
-Genie Bot L1/L2 Support PoC — Streamlit App
+genie_bot_streamlit_poc.py  —  Genie Bot L1/L2 Support PoC
+===========================================================
 
-RAG API spec (from your screenshot):
+Flow:
+  1. User pastes log → clicks Diagnose
+  2. RAG API called → L1 resolution shown
+  3. User tries fix manually
+  4. If still broken → clicks "Escalate to L2"
+  5. RAG API called again → pre-filled L2 template shown as-is
+
+RAG spec:
   POST /generation/{usecase_id}/{pipeline_id}
-  Header : AMToken = <JWT token>
+  Header : AMToken = <JWT>
   Body   : { "query": "...", "history": [{"question":"...","answer":"..."}] }
 
-JWT flow (exact match to your existing code):
-  Step 1 : POST OpenAM auth_url   → tokenId (SSO token)
-  Step 2 : POST tokenTranslator_v2 → issued_token (JWT)
-  Step 3 : JWT set as AMToken header on every RAG call
-  Step 4 : Auto-refresh every 25s (token expires at 30s)
-
-No FAISS. No embedding model. No separate LLM call.
-The RAG endpoint handles retrieval + generation internally.
-
-Run:
-    pip install streamlit requests httpx truststore python-dotenv
-    streamlit run genie_bot_streamlit_poc.py
+JWT: OpenAM → SSO tokenId → JWT (expires 30s, auto-refreshes every 25s)
 """
 
-import json
-import os
-import ssl
-import threading
-import time
-import uuid
+import json, os, ssl, threading, time, uuid
 from datetime import datetime, timezone
-from pathlib import Path
 from typing import Optional
 
-import httpx
-import requests
-import streamlit as st
-import truststore
+import requests, streamlit as st, truststore
 from dotenv import load_dotenv
 
 load_dotenv()
@@ -43,90 +29,63 @@ load_dotenv()
 # ══════════════════════════════════════════════════════════════════════════
 #  CONFIG
 # ══════════════════════════════════════════════════════════════════════════
-
-# ── OpenAM / SSO ──────────────────────────────────────────────────────────
 USERNAME    = os.getenv("OPENAM_USERNAME", "")
 PASSWORD    = os.getenv("OPENAM_PASSWORD", "")
 FQDN        = os.getenv("FQDN",           "")
 AUTH_URL    = os.getenv("AUTH_URL",        f"https://{FQDN}/openam/json/authenticate")
 JWT_VERSION = os.getenv("JWT_VERSION",    "v2")
 VERIFY_TLS  = os.getenv("VERIFY_TLS",    "true").lower() == "true"
-TOKEN_TTL   = 30  # your token expires at 30s
+TOKEN_TTL   = 30
 
-# ── RAG API ───────────────────────────────────────────────────────────────
-RAG_BASE_URL  = os.getenv("RAG_BASE_URL",  f"https://{FQDN}")  # host only, no path
-RAG_USECASE   = os.getenv("RAG_USECASE_ID",  "")   # {usecase_id} in the path
-RAG_PIPELINE  = os.getenv("RAG_PIPELINE_ID", "")   # {pipeline_id} in the path
-RAG_TIMEOUT   = int(os.getenv("RAG_TIMEOUT", "60"))
+RAG_BASE_URL = os.getenv("RAG_BASE_URL",     f"https://{FQDN}")
+RAG_USECASE  = os.getenv("RAG_USECASE_ID",  "")
+RAG_PIPELINE = os.getenv("RAG_PIPELINE_ID", "")
+RAG_TIMEOUT  = int(os.getenv("RAG_TIMEOUT", "60"))
 
-# ── JWT translator paths ──────────────────────────────────────────────────
 _JWT_PATHS = {
     "v1": "/dsp/rest-sts/DSP_iB2B/iB2B_tokenTranslator",
     "v2": "/dsp/rest-sts/DSP_iB2B/iB2B_tokenTranslator_v2",
 }
 
-# ── System prompts sent as the first query to shape RAG behaviour ─────────
-L1_INSTRUCTION = """You are a Genie Bot L1 support agent. 
-Given the error log below, use the knowledge base to:
-1. Identify the root cause in plain English (no jargon)
-2. Provide numbered fix steps a non-technical business user can follow
-3. State whether it is safe to manually rerun the bot after the fix
-4. Reference the SOP number if found
+# ── Prompts ───────────────────────────────────────────────────────────────
+L1_QUERY = """You are a Genie Bot L1 support agent.
+Analyse the error log below using the knowledge base.
+Provide:
+1. Root cause in plain English (no jargon)
+2. Step-by-step fix the user can try themselves
+3. Whether it is safe to manually rerun the bot after the fix
+4. SOP reference number if found
 
-If no clear fix is available, explicitly say ESCALATE TO L2.
-
-Respond in this JSON format only (no markdown fences):
-{
-  "decision": "L1_FIX_AVAILABLE" or "ESCALATE",
-  "confidence": "HIGH" or "MEDIUM" or "LOW",
-  "root_cause": "plain English explanation",
-  "plain_english_fix": "numbered steps",
-  "rerun_safe": true or false,
-  "sop_reference": "SOP ref or null"
-}
+If no fix is available in the knowledge base, say clearly that this needs L2 escalation.
 
 ERROR LOG:
-"""
+{log}"""
 
-L2_INSTRUCTION = """You are a Genie Bot L2 escalation agent.
-Pre-fill the following support ticket fields using the error log and diagnosis below.
-Respond with JSON only — keys are field names, values are pre-filled content.
+L2_QUERY = """The user tried the L1 fix but the issue persists. 
+Using the knowledge base, pre-fill the L2 escalation support ticket for this error.
+Include all relevant fields: error summary, affected module, classification, priority,
+root cause, what was already tried, stack trace summary, SOP reference, run ID if visible.
 
-Fields to fill:
-- Error Summary (mandatory)
-- Affected Module (mandatory)  
-- Error Classification (mandatory: Configuration/Timeout/Null Reference/Authentication/Data/Unknown)
-- Priority (mandatory: High/Medium/Low)
-- Root Cause (mandatory)
-- L1 Fix Attempted (mandatory: Yes with outcome, or No)
-- Stack Trace Summary (mandatory: plain English)
-- SOP Reference (optional)
-- Run ID (optional: extract from log if present)
-- Bot Version (optional: extract from log if present)
+Previous L1 resolution attempt:
+{l1_answer}
 
-Error log and L1 diagnosis:
-"""
+ERROR LOG:
+{log}"""
 
 
 # ══════════════════════════════════════════════════════════════════════════
-#  AUTH LAYER — exact replica of your existing code
+#  AUTH — exact replica of your existing functions
 # ══════════════════════════════════════════════════════════════════════════
-
-def translate_sso_to_jwt(fqdn: str, sso_token: str,
-                          version: str = "v2",
-                          verify_tls: bool = True,
-                          timeout: int = 30) -> str:
-    """Exact replica of your translate_sso_to_jwt."""
+def translate_sso_to_jwt(fqdn, sso_token, version="v2",
+                          verify_tls=True, timeout=30) -> str:
     if version not in _JWT_PATHS:
         raise ValueError("version must be 'v1' or 'v2'")
     resp = requests.post(
         f"https://{fqdn}{_JWT_PATHS[version]}",
         params={"_action": "translate"},
         headers={"Content-Type": "application/json", "Accept": "application/json"},
-        json={
-            "input_token_state":  {"token_type": "SSOTOKEN", "tokenId": sso_token},
-            "output_token_state": {"token_type": "JWT"},
-        },
+        json={"input_token_state":  {"token_type": "SSOTOKEN", "tokenId": sso_token},
+              "output_token_state": {"token_type": "JWT"}},
         timeout=timeout, verify=verify_tls,
     )
     resp.raise_for_status()
@@ -137,67 +96,51 @@ def translate_sso_to_jwt(fqdn: str, sso_token: str,
 
 
 def get_access_token() -> dict:
-    """Exact replica of your get_access_token. Returns {'jwt': token}."""
     resp = requests.post(
         AUTH_URL,
-        headers={
-            "Accept-API-Version": "resource=2.0, protocol=1.0",
-            "Content-Type":       "application/json",
-            "X-OpenAM-Username":  USERNAME,
-            "X-OpenAM-Password":  PASSWORD,
-        },
+        headers={"Accept-API-Version": "resource=2.0, protocol=1.0",
+                 "Content-Type": "application/json",
+                 "X-OpenAM-Username": USERNAME,
+                 "X-OpenAM-Password": PASSWORD},
         json={}, timeout=30, verify=VERIFY_TLS,
     )
     resp.raise_for_status()
     data     = resp.json()
     token_id = data.get("tokenId") or data.get("tokenid", "")
-    jwt      = translate_sso_to_jwt(FQDN, token_id,
-                                    version=JWT_VERSION,
-                                    verify_tls=VERIFY_TLS)
-    return {"jwt": jwt}
+    return {"jwt": translate_sso_to_jwt(FQDN, token_id,
+                                        version=JWT_VERSION,
+                                        verify_tls=VERIFY_TLS)}
 
 
 def get_token() -> str:
-    """Exact replica of your get_token."""
     return get_access_token().get("jwt", "")
 
 
 # ══════════════════════════════════════════════════════════════════════════
-#  JWT AUTO-REFRESH — background thread, 30s TTL
+#  JWT MANAGER — background refresh every 25s
 # ══════════════════════════════════════════════════════════════════════════
-
 class JWTManager:
-    """
-    Keeps JWT alive. Refreshes every 25s to stay ahead of the 30s expiry.
-    Token used as AMToken header on every RAG API call.
-    """
-
     def __init__(self):
-        self._token        = ""
-        self._expires_at   = 0.0
-        self._lock         = threading.Lock()
+        self._token = ""; self._expires_at = 0.0
+        self._lock  = threading.Lock()
         self._thread: Optional[threading.Thread] = None
-        self._running      = False
-        self.last_refresh  = "Never"
-        self.last_error    = ""
-        self.refresh_count = 0
+        self._running = False
+        self.last_refresh = "Never"; self.last_error = ""; self.refresh_count = 0
 
     @property
-    def token(self) -> str:
+    def token(self):
         with self._lock: return self._token
 
     @property
-    def is_valid(self) -> bool:
-        with self._lock:
-            return bool(self._token) and time.time() < self._expires_at
+    def is_valid(self):
+        with self._lock: return bool(self._token) and time.time() < self._expires_at
 
     @property
-    def seconds_remaining(self) -> int:
-        with self._lock:
-            return max(0, int(self._expires_at - time.time()))
+    def seconds_remaining(self):
+        with self._lock: return max(0, int(self._expires_at - time.time()))
 
     def start(self):
-        self._fetch()   # synchronous first fetch — must succeed before returning
+        self._fetch()
         self._running = True
         self._thread  = threading.Thread(target=self._loop, daemon=True)
         self._thread.start()
@@ -207,172 +150,80 @@ class JWTManager:
 
     def _loop(self):
         while self._running:
-            time.sleep(max(TOKEN_TTL - 5, 5))  # refresh 5s before expiry
+            time.sleep(max(TOKEN_TTL - 5, 5))
             self._fetch()
 
     def _fetch(self):
         try:
             tok = get_token()
             with self._lock:
-                self._token        = tok
-                self._expires_at   = time.time() + TOKEN_TTL
-                self.last_refresh  = datetime.now(timezone.utc).strftime("%H:%M:%S UTC")
-                self.last_error    = ""
+                self._token = tok
+                self._expires_at = time.time() + TOKEN_TTL
+                self.last_refresh = datetime.now(timezone.utc).strftime("%H:%M:%S UTC")
+                self.last_error   = ""
                 self.refresh_count += 1
         except Exception as e:
-            with self._lock:
-                self.last_error = str(e)
-            # Keep old token on transient failures — do not clear
+            with self._lock: self.last_error = str(e)
 
 
 # ══════════════════════════════════════════════════════════════════════════
-#  RAG API CLIENT
+#  RAG API
 # ══════════════════════════════════════════════════════════════════════════
-
-def _rag_url() -> str:
-    """Build: {RAG_BASE_URL}/generation/{usecase_id}/{pipeline_id}"""
-    base = RAG_BASE_URL.rstrip("/")
-    return f"{base}/generation/{RAG_USECASE}/{RAG_PIPELINE}"
+def rag_url() -> str:
+    return f"{RAG_BASE_URL.rstrip('/')}/generation/{RAG_USECASE}/{RAG_PIPELINE}"
 
 
-def call_rag(
-    query: str,
-    jwt: str,
-    history: list[dict] | None = None,
-) -> dict:
+def call_rag(query: str, jwt: str, history: list) -> tuple[str, dict]:
     """
-    POST /generation/{usecase_id}/{pipeline_id}
-    Header : AMToken = <jwt>
-    Body   : { "query": "...", "history": [...] }
-
-    Returns the full response JSON.
-    The answer text is extracted from common response field names.
+    POST to RAG endpoint.
+    Returns (answer_text, full_raw_response).
     """
-    url     = _rag_url()
-    headers = {
-        "Content-Type": "application/json",
-        "Accept":       "application/json",
-        "AMToken":      jwt,                    # ← your header key from the spec
-    }
-    body = {
-        "query":   query,
-        "history": history or [],
-    }
-
     resp = requests.post(
-        url, headers=headers, json=body,
+        rag_url(),
+        headers={"Content-Type": "application/json",
+                 "Accept":       "application/json",
+                 "AMToken":      jwt},
+        json={"query": query, "history": history},
         timeout=RAG_TIMEOUT, verify=VERIFY_TLS,
     )
     resp.raise_for_status()
-    return resp.json()
+    raw = resp.json()
 
-
-def extract_answer(rag_response: dict) -> str:
-    """
-    Extract the text answer from the RAG response.
-    Tries common field names — update if your response shape differs.
-    """
+    # Extract answer text — try common field names
+    answer = ""
     for key in ("answer", "response", "result", "output", "text", "content"):
-        val = rag_response.get(key)
+        val = raw.get(key)
         if val and isinstance(val, str):
-            return val
-    # If nested under 'data' or 'choices'
-    if "data" in rag_response and isinstance(rag_response["data"], dict):
-        return extract_answer(rag_response["data"])
-    if "choices" in rag_response:
-        try:
-            return rag_response["choices"][0]["message"]["content"]
-        except Exception:
-            pass
-    # Fallback — return full JSON so nothing is silently lost
-    return json.dumps(rag_response, indent=2)
+            answer = val
+            break
+    if not answer:
+        answer = json.dumps(raw, indent=2)  # show full response if no known key
 
-
-def _parse_json_from_answer(answer: str) -> dict:
-    """Parse JSON from LLM answer text. Handles markdown fences."""
-    clean = answer.strip().lstrip("```json").lstrip("```").rstrip("```").strip()
-    try:
-        return json.loads(clean)
-    except json.JSONDecodeError:
-        return {"_raw": answer}
-
-
-# ══════════════════════════════════════════════════════════════════════════
-#  L1 TRIAGE via RAG API
-# ══════════════════════════════════════════════════════════════════════════
-
-def run_l1_rag(log_text: str, jwt: str,
-               history: list[dict]) -> tuple[dict, dict, list[dict]]:
-    """
-    Send log to RAG endpoint with L1 instruction prepended.
-    Returns (l1_parsed_dict, raw_rag_response, updated_history).
-    """
-    query = L1_INSTRUCTION + log_text[:2500]
-
-    raw_resp = call_rag(query, jwt, history)
-    answer   = extract_answer(raw_resp)
-    l1       = _parse_json_from_answer(answer)
-
-    # Append to history for potential follow-up L2 call
-    updated_history = history + [
-        {"question": query, "answer": answer}
-    ]
-    return l1, raw_resp, updated_history
-
-
-# ══════════════════════════════════════════════════════════════════════════
-#  L2 TEMPLATE PRE-FILL via RAG API
-# ══════════════════════════════════════════════════════════════════════════
-
-def run_l2_rag(log_text: str, l1_result: dict,
-               jwt: str, history: list[dict]) -> tuple[dict, list[dict]]:
-    """
-    Send log + L1 diagnosis to RAG endpoint for L2 template pre-fill.
-    History carries the L1 context so RAG has full conversation.
-    Returns (l2_filled_dict, updated_history).
-    """
-    query = (
-        L2_INSTRUCTION
-        + f"\n\nERROR LOG:\n{log_text[:1500]}"
-        + f"\n\nL1 DIAGNOSIS:\n{json.dumps(l1_result, indent=2)}"
-    )
-
-    raw_resp = call_rag(query, jwt, history)
-    answer   = extract_answer(raw_resp)
-    l2       = _parse_json_from_answer(answer)
-
-    updated_history = history + [
-        {"question": query, "answer": answer}
-    ]
-    return l2, updated_history
+    return answer, raw
 
 
 # ══════════════════════════════════════════════════════════════════════════
 #  STREAMLIT UI
 # ══════════════════════════════════════════════════════════════════════════
-
-st.set_page_config(
-    page_title="Genie Bot AI Support",
-    page_icon="🤖",
-    layout="wide",
-    initial_sidebar_state="expanded",
-)
+st.set_page_config(page_title="Genie Bot AI Support", page_icon="🤖",
+                   layout="wide", initial_sidebar_state="expanded")
 
 st.markdown("""
 <style>
-  .block-container { padding-top: 1.4rem; }
+  .block-container { padding-top: 1.2rem; }
   .stTextArea textarea { font-family: monospace; font-size: 12px; }
   .l1box {
     background: #f0fdf4; border-left: 4px solid #16a34a;
-    border-radius: 6px; padding: 16px 20px; margin: 10px 0;
+    border-radius: 6px; padding: 18px 22px; margin: 12px 0;
   }
   .l2box {
     background: #eff6ff; border-left: 4px solid #2563eb;
-    border-radius: 6px; padding: 16px 20px; margin: 10px 0;
+    border-radius: 6px; padding: 18px 22px; margin: 12px 0;
   }
-  .warnbox {
-    background: #fefce8; border-left: 4px solid #ca8a04;
+  .stepbox {
+    background: #fafafa; border: 1px solid #e5e7eb;
     border-radius: 6px; padding: 12px 16px; margin: 8px 0;
+    font-size: 13px;
   }
   .specbox {
     background: #f8fafc; border: 1px solid #e2e8f0;
@@ -383,17 +234,18 @@ st.markdown("""
 """, unsafe_allow_html=True)
 
 # ── Session state ──────────────────────────────────────────────────────────
-_defaults = {
-    "jwt_manager":   None,
-    "jwt_started":   False,
-    "result":        None,
-    "l2_filled":     None,
-    "rag_history":   [],      # conversation history for the RAG endpoint
-    "raw_rag_resp":  None,
-}
-for k, v in _defaults.items():
-    if k not in st.session_state:
-        st.session_state[k] = v
+for k, v in {
+    "jwt_manager":  None,
+    "jwt_started":  False,
+    "stage":        "idle",      # idle | l1_done | l2_done
+    "log_text":     "",
+    "l1_answer":    "",          # raw text answer from RAG for L1
+    "l1_raw_resp":  None,        # full RAG JSON for L1
+    "l2_answer":    "",          # raw text answer from RAG for L2
+    "l2_raw_resp":  None,        # full RAG JSON for L2
+    "rag_history":  [],          # conversation history sent to RAG
+}.items():
+    if k not in st.session_state: st.session_state[k] = v
 
 if st.session_state.jwt_manager is None:
     st.session_state.jwt_manager = JWTManager()
@@ -406,33 +258,23 @@ jm: JWTManager = st.session_state.jwt_manager
 with st.sidebar:
     st.markdown("## ⚙️ Setup")
 
-    # ── RAG API config summary ────────────────────────────────────────────
-    st.markdown("### 🔌 RAG API Endpoint")
-    endpoint_url = _rag_url()
+    # Endpoint info
+    st.markdown("### 🔌 RAG Endpoint")
     st.markdown(f"""<div class="specbox">
-<b>POST</b> {endpoint_url or '⚠ Set RAG_BASE_URL + RAG_USECASE_ID + RAG_PIPELINE_ID'}<br/><br/>
-<b>Header</b><br/>
-AMToken: &lt;JWT token&gt;<br/><br/>
-<b>Body</b><br/>
-{{<br/>
-&nbsp;&nbsp;"query": "...",<br/>
-&nbsp;&nbsp;"history": [{{<br/>
-&nbsp;&nbsp;&nbsp;&nbsp;"question": "...",<br/>
-&nbsp;&nbsp;&nbsp;&nbsp;"answer": "..."<br/>
-&nbsp;&nbsp;}}]<br/>
-}}<br/><br/>
-<b>Auth</b><br/>
-{AUTH_URL or '⚠ AUTH_URL not set'} → v{JWT_VERSION}
+<b>POST</b> {rag_url() or '⚠ Configure env vars'}<br/><br/>
+<b>Header</b>: AMToken: &lt;JWT&gt;<br/><br/>
+<b>Body</b>:<br/>
+{{"query": "...",<br/>
+&nbsp;"history": [{{"question":"...","answer":"..."}}]}}<br/><br/>
+<b>Auth</b>: {AUTH_URL or '⚠ AUTH_URL not set'} → v{JWT_VERSION}
 </div>""", unsafe_allow_html=True)
 
     st.divider()
 
-    # ── JWT ───────────────────────────────────────────────────────────────
-    st.markdown("### 🔐 JWT Token  `30s TTL`")
-
+    # JWT
+    st.markdown(f"### 🔐 JWT  `30s TTL`")
     if not st.session_state.jwt_started:
-        st.info("JWT is sent as **AMToken** header on every RAG call.")
-        if st.button("▶ Start JWT Refresh", type="primary", use_container_width=True):
+        if st.button("▶ Start JWT", type="primary", use_container_width=True):
             with st.spinner("OpenAM → SSO → JWT…"):
                 try:
                     jm.start()
@@ -442,25 +284,17 @@ AMToken: &lt;JWT token&gt;<br/><br/>
                     st.error(f"Auth failed: {e}")
     else:
         secs = jm.seconds_remaining
-        if jm.is_valid:
-            col = "🟢" if secs > 10 else "🟡"
-            st.success(f"{col} Active — **{secs}s** remaining")
-        else:
-            st.error("🔴 Expired")
+        c = "🟢" if secs > 10 else "🟡"
+        st.success(f"{c} Active — **{secs}s** left") if jm.is_valid else st.error("🔴 Expired")
 
         c1, c2 = st.columns(2)
         if c1.button("🔄 Refresh", use_container_width=True):
-            with st.spinner("Refreshing…"):
-                jm.refresh()
-            st.rerun()
+            jm.refresh(); st.rerun()
         if c2.button("⏹ Stop", use_container_width=True):
-            jm.stop()
-            st.session_state.jwt_started = False
-            st.rerun()
+            jm.stop(); st.session_state.jwt_started = False; st.rerun()
 
         st.caption(f"Last: {jm.last_refresh}  |  #{jm.refresh_count}")
-        if jm.last_error:
-            st.error(f"⚠ {jm.last_error[:120]}")
+        if jm.last_error: st.error(f"⚠ {jm.last_error[:100]}")
         if jm.token:
             tok = jm.token
             st.code(tok[:16] + "…" + tok[-6:], language=None)
@@ -468,32 +302,20 @@ AMToken: &lt;JWT token&gt;<br/><br/>
 
     st.divider()
 
-    # ── Conversation history ──────────────────────────────────────────────
-    st.markdown("### 💬 Conversation History")
-    hist = st.session_state.rag_history
-    st.caption(f"{len(hist)} turn(s) in history sent with each call")
-    if hist:
-        with st.expander("View history"):
-            for i, turn in enumerate(hist, 1):
-                st.markdown(f"**Turn {i}**")
-                st.caption(f"Q: {turn['question'][:80]}…")
-                st.caption(f"A: {turn['answer'][:80]}…")
-    if st.button("🗑 Clear History", use_container_width=True):
-        st.session_state.rag_history = []
+    # Reset
+    if st.button("🔄 Start Over", use_container_width=True):
+        for k in ["stage","log_text","l1_answer","l1_raw_resp",
+                  "l2_answer","l2_raw_resp","rag_history"]:
+            st.session_state[k] = [] if k == "rag_history" else (None if "resp" in k else "")
+        st.session_state.stage = "idle"
         st.rerun()
 
+    # Response field override
     st.divider()
-
-    # ── Override response field name ──────────────────────────────────────
-    st.markdown("### 🔧 Response Field")
-    st.text_input(
-        "Answer field name in RAG response",
-        value="answer",
-        key="answer_field",
-        help="The JSON key that holds the answer text in your RAG response"
-    )
+    st.markdown("### 🔧 Response key")
+    st.text_input("Answer field in RAG response", value="answer", key="answer_field",
+                  help="Key that holds the answer text. e.g. answer / response / result")
     st.caption("Common values: answer / response / result / output")
-
     st.divider()
     st.caption("🔒 Genie Bot AI Copilot · PoC")
 
@@ -503,252 +325,198 @@ AMToken: &lt;JWT token&gt;<br/><br/>
 # ══════════════════════════════════════════════════════════════════════════
 st.title("🤖 Genie Bot AI Support Copilot")
 st.caption(
-    f"RAG API: `POST /generation/{RAG_USECASE}/{RAG_PIPELINE}`  "
-    f"| Auth: `AMToken` header  "
-    f"| Returns: L1 fix or pre-filled L2 template"
+    f"`POST /generation/{RAG_USECASE}/{RAG_PIPELINE}`  "
+    f"| Auth: `AMToken` header"
 )
 
-if not st.session_state.jwt_started:
-    st.info("👈 Start the JWT manager from the sidebar to begin.")
+# ── STAGE: IDLE — show log input ──────────────────────────────────────────
+if st.session_state.stage == "idle":
 
-# ── Log input ─────────────────────────────────────────────────────────────
-tab_paste, tab_upload = st.tabs(["📋 Paste Log", "📁 Upload Log File"])
-log_text = ""
+    if not st.session_state.jwt_started:
+        st.info("👈 Start the JWT manager from the sidebar to begin.")
 
-with tab_paste:
-    log_text = st.text_area(
-        "Paste Genie Bot error log",
-        height=220,
-        placeholder=(
-            "[2026-05-27 09:14:32 UTC] RUN_ID=GBT-20260527-0042 ENV=PROD\n"
-            "[ERROR] Module: TradeDataExtractor | Exit: FAILED\n"
-            "[ERROR] System.NullReferenceException: Object reference not set\n"
-            "   at GeniBot.Core.DataExtractor.Execute() line 142\n"
-            "[INPUT] Entity=GBCIB | ReportDate=2026-05-27"
-        ),
-        key="log_paste",
-    )
+    tab_paste, tab_upload = st.tabs(["📋 Paste Log", "📁 Upload File"])
 
-with tab_upload:
-    uploaded = st.file_uploader("Upload .log / .txt", type=["log", "txt"])
-    if uploaded:
-        log_text = uploaded.read().decode("utf-8", errors="replace")
-        st.text_area(
-            "Preview",
-            value=log_text[:600] + ("…" if len(log_text) > 600 else ""),
-            height=140, disabled=True,
+    with tab_paste:
+        log_input = st.text_area(
+            "Paste Genie Bot error log",
+            height=240,
+            placeholder=(
+                "[2026-05-27 09:14:32 UTC] RUN_ID=GBT-20260527-0042 ENV=PROD\n"
+                "[ERROR] Module: TradeDataExtractor | Exit: FAILED\n"
+                "[ERROR] System.NullReferenceException: Object reference not set\n"
+                "   at GeniBot.Core.DataExtractor.Execute() line 142\n"
+                "[INPUT] Entity=GBCIB | ReportDate=2026-05-27"
+            ),
+            key="log_paste_input",
         )
 
-# ── Action buttons ─────────────────────────────────────────────────────────
-ready = st.session_state.jwt_started and jm.is_valid
-col_btn, col_clr = st.columns([4, 1])
+    with tab_upload:
+        uploaded = st.file_uploader("Upload .log / .txt", type=["log", "txt"])
+        log_input = ""
+        if uploaded:
+            log_input = uploaded.read().decode("utf-8", errors="replace")
+            st.text_area("Preview",
+                         value=log_input[:600] + ("…" if len(log_input) > 600 else ""),
+                         height=140, disabled=True)
+        else:
+            log_input = st.session_state.get("log_paste_input", "")
 
-diag_btn = col_btn.button(
-    "🔍 Diagnose Issue",
-    type="primary",
-    use_container_width=True,
-    disabled=not ready,
-)
-if not ready:
-    col_btn.caption(
-        "⚠ Start JWT manager first" if not st.session_state.jwt_started
-        else "⚠ JWT expired — click Refresh in sidebar"
-    )
+    ready = st.session_state.jwt_started and jm.is_valid
+    btn   = st.button("🔍 Diagnose Issue", type="primary",
+                       use_container_width=True, disabled=not ready)
+    if not ready:
+        st.caption("⚠ Start JWT manager first" if not st.session_state.jwt_started
+                   else "⚠ JWT expired — refresh in sidebar")
 
-if col_clr.button("🗑 Clear", use_container_width=True):
-    st.session_state.result    = None
-    st.session_state.l2_filled = None
-    st.session_state.raw_rag_resp = None
-    st.rerun()
-
-# ── Run diagnosis ─────────────────────────────────────────────────────────
-if diag_btn:
-    if not log_text.strip():
-        st.warning("Please paste or upload an error log first.")
-    elif not RAG_USECASE or not RAG_PIPELINE:
-        st.error(
-            "RAG_USECASE_ID and RAG_PIPELINE_ID are not set. "
-            "Add them to your .env file."
-        )
-    else:
-        jwt     = jm.token
-        history = st.session_state.rag_history
-
-        # ── Step 1: L1 triage ─────────────────────────────────────────────
-        with st.spinner(
-            f"🤖 Calling RAG API for L1 triage…  "
-            f"({_rag_url()})"
-        ):
-            try:
-                l1, raw_resp, history = run_l1_rag(log_text, jwt, history)
-                st.session_state.rag_history  = history
-                st.session_state.raw_rag_resp = raw_resp
-            except requests.HTTPError as e:
-                st.error(f"RAG API error {e.response.status_code}: {e.response.text[:300]}")
-                st.stop()
-            except Exception as e:
-                st.error(f"RAG call failed: {e}")
-                st.stop()
-
-        # Override answer field if user changed it
-        answer_field = st.session_state.get("answer_field", "answer")
-        if answer_field != "answer" and answer_field in raw_resp:
-            l1 = _parse_json_from_answer(raw_resp[answer_field])
-
-        # ── Step 2: If ESCALATE, pre-fill L2 template ─────────────────────
-        l2 = None
-        decision = l1.get("decision", "ESCALATE") if "_raw" not in l1 else "ESCALATE"
-
-        if decision == "ESCALATE" or "_raw" in l1:
-            with st.spinner("📋 Pre-filling L2 escalation template via RAG API…"):
+    if btn:
+        if not log_input.strip():
+            st.warning("Please paste or upload an error log first.")
+        elif not RAG_USECASE or not RAG_PIPELINE:
+            st.error("Set RAG_USECASE_ID and RAG_PIPELINE_ID in your .env file.")
+        else:
+            with st.spinner(f"🤖 Calling RAG API for L1 resolution…"):
                 try:
-                    l2, history = run_l2_rag(log_text, l1, jwt, history)
-                    st.session_state.rag_history = history
+                    query   = L1_QUERY.format(log=log_input[:2500])
+                    answer, raw = call_rag(query, jm.token, [])
+
+                    # Override answer field if user changed it
+                    af = st.session_state.get("answer_field", "answer")
+                    if af != "answer" and isinstance(raw.get(af), str):
+                        answer = raw[af]
+
+                    st.session_state.log_text    = log_input
+                    st.session_state.l1_answer   = answer
+                    st.session_state.l1_raw_resp = raw
+                    # Save this turn to history for the L2 call
+                    st.session_state.rag_history = [
+                        {"question": query, "answer": answer}
+                    ]
+                    st.session_state.stage = "l1_done"
+                    st.rerun()
+                except requests.HTTPError as e:
+                    st.error(f"RAG API {e.response.status_code}: {e.response.text[:300]}")
                 except Exception as e:
-                    st.warning(f"L2 pre-fill failed: {e}")
-                    l2 = {}
-
-        st.session_state.result   = {
-            "l1": l1, "decision": decision, "log": log_text
-        }
-        st.session_state.l2_filled = l2
+                    st.error(f"Call failed: {e}")
 
 
-# ══════════════════════════════════════════════════════════════════════════
-#  RESULTS
-# ══════════════════════════════════════════════════════════════════════════
-if st.session_state.result:
-    r        = st.session_state.result
-    l1       = r["l1"]
-    decision = r["decision"]
-    conf     = l1.get("confidence", "LOW") if "_raw" not in l1 else "LOW"
-    ci       = {"HIGH": "🟢", "MEDIUM": "🟡", "LOW": "🔴"}.get(conf, "⚪")
+# ── STAGE: L1 DONE — show L1 resolution + Escalate button ─────────────────
+elif st.session_state.stage == "l1_done":
+
+    st.markdown("### 📋 Error Log")
+    with st.expander("View submitted log", expanded=False):
+        st.code(st.session_state.log_text, language="text")
 
     st.markdown("---")
 
-    # Summary strip
-    c1, c2, c3, c4 = st.columns(4)
-    c1.metric("Decision",    "✅ L1 Fix" if decision == "L1_FIX_AVAILABLE" else "🔴 Escalate")
-    c2.metric("Confidence",  f"{ci} {conf}")
-    c3.metric("SOP Match",   l1.get("sop_reference") or "—")
-    c4.metric("Rerun Safe",  "✅ Yes" if l1.get("rerun_safe") else "❌ No")
+    # L1 answer — show exactly as received from RAG
+    st.markdown('<div class="l1box">', unsafe_allow_html=True)
+    st.markdown("### ✅ L1 Resolution")
+    st.caption("From RAG knowledge base — review the steps below and try the fix manually")
+    st.markdown(st.session_state.l1_answer)
+    st.markdown("</div>", unsafe_allow_html=True)
 
     st.markdown("---")
 
-    # Tabs
-    if decision == "L1_FIX_AVAILABLE" and "_raw" not in l1:
-        t1, t2, t3 = st.tabs(["✅ L1 Fix", "💬 RAG Debug", "🔧 Raw JSON"])
-    else:
-        t1, t2, t3, t4 = st.tabs(["📋 L2 Template", "❌ Why Escalated",
-                                    "💬 RAG Debug",    "🔧 Raw JSON"])
+    # User decision
+    st.markdown('<div class="stepbox">', unsafe_allow_html=True)
+    st.markdown("**After trying the fix above:**")
+    st.markdown("</div>", unsafe_allow_html=True)
 
-    # ── L1 Fix ────────────────────────────────────────────────────────────
-    if decision == "L1_FIX_AVAILABLE" and "_raw" not in l1:
-        with t1:
-            st.markdown('<div class="l1box">', unsafe_allow_html=True)
-            st.markdown(f"### ✅ L1 Fix Found — **{conf}** confidence")
+    col_fixed, col_escalate = st.columns(2)
 
-            if l1.get("root_cause"):
-                st.markdown("**🔍 Root Cause**")
-                st.info(l1["root_cause"])
-
-            if l1.get("plain_english_fix"):
-                st.markdown("**🔧 Steps (plain English)**")
-                for line in l1["plain_english_fix"].split("\n"):
-                    if line.strip():
-                        st.write(line)
-
-            rerun = l1.get("rerun_safe", False)
-            st.markdown(
-                f"**Rerun Safe:** "
-                f"{'✅ Yes — apply fix then re-run the bot manually' if rerun else '❌ No — do NOT rerun; escalate if fix does not work'}"
+    with col_fixed:
+        if st.button("✅ Fix Worked — Log as Resolved",
+                     use_container_width=True, type="primary"):
+            st.success(
+                "✅ Great! Issue resolved. "
+                "Wire your Jira agent here to auto-create a DONE ticket."
             )
-            if l1.get("sop_reference"):
-                st.caption(f"SOP: `{l1['sop_reference']}`")
-            st.markdown("</div>", unsafe_allow_html=True)
 
-    # ── L2 Template ───────────────────────────────────────────────────────
-    if decision == "ESCALATE" or "_raw" in l1:
-        with t1:
-            st.markdown('<div class="l2box">', unsafe_allow_html=True)
-            st.markdown("### 📋 Pre-filled L2 Escalation Template")
-            st.caption("Review · edit · add comments · then submit")
-            st.markdown("</div>", unsafe_allow_html=True)
-
-            l2 = st.session_state.l2_filled or {}
-
-            if "_raw" in l2:
-                # RAG returned free-text, not JSON — show in editable box
-                st.markdown("**RAG response (edit below):**")
-                st.text_area("L2 Content", value=l2["_raw"], height=300, key="l2_raw")
-            else:
-                # Render standard template fields
-                l2_fields = [
-                    ("Error Summary",        "mandatory"),
-                    ("Affected Module",      "mandatory"),
-                    ("Error Classification", "mandatory"),
-                    ("Priority",             "mandatory"),
-                    ("Root Cause",           "mandatory"),
-                    ("L1 Fix Attempted",     "mandatory"),
-                    ("Stack Trace Summary",  "mandatory"),
-                    ("SOP Reference",        "optional"),
-                    ("Run ID",               "optional"),
-                    ("Bot Version",          "optional"),
-                ]
-                filled = {}
-                for fname, req in l2_fields:
-                    label = f"{fname} {'*(required)*' if req == 'mandatory' else ''}"
-                    filled[fname] = st.text_area(
-                        label,
-                        value=l2.get(fname, ""),
-                        height=64,
-                        key=f"f_{fname}",
+    with col_escalate:
+        escalate_ready = st.session_state.jwt_started and jm.is_valid
+        if st.button("🔴 Still Broken — Escalate to L2",
+                     use_container_width=True, disabled=not escalate_ready):
+            with st.spinner("📋 Calling RAG API for L2 escalation template…"):
+                try:
+                    query = L2_QUERY.format(
+                        l1_answer=st.session_state.l1_answer,
+                        log=st.session_state.log_text[:1500],
+                    )
+                    answer, raw = call_rag(
+                        query, jm.token,
+                        st.session_state.rag_history,   # L1 turn as history
                     )
 
-                st.markdown("---")
-                extra = st.text_area(
-                    "Additional Comments *(optional)*",
-                    height=72, key="extra_cmts",
-                )
-                if extra:
-                    filled["User Comments"] = extra
+                    af = st.session_state.get("answer_field", "answer")
+                    if af != "answer" and isinstance(raw.get(af), str):
+                        answer = raw[af]
 
-                cs, cc = st.columns(2)
-                if cs.button("🚀 Submit to L2", type="primary", use_container_width=True):
-                    st.success("✅ Submitted — wire your Jira agent here.")
-                if cc.button("📋 Export JSON", use_container_width=True):
-                    st.code(json.dumps(filled, indent=2), language="json")
+                    st.session_state.l2_answer   = answer
+                    st.session_state.l2_raw_resp = raw
+                    # Append L2 turn to history
+                    st.session_state.rag_history.append(
+                        {"question": query, "answer": answer}
+                    )
+                    st.session_state.stage = "l2_done"
+                    st.rerun()
+                except requests.HTTPError as e:
+                    st.error(f"RAG API {e.response.status_code}: {e.response.text[:300]}")
+                except Exception as e:
+                    st.error(f"Call failed: {e}")
 
-        with t2:
-            if "_raw" in l1:
-                st.markdown('<div class="warnbox">', unsafe_allow_html=True)
-                st.markdown(
-                    "The RAG API returned a non-JSON response for L1. "
-                    "This usually means the knowledge base didn't find a structured SOP match. "
-                    "Escalating to L2."
-                )
-                st.markdown("</div>", unsafe_allow_html=True)
-                st.markdown("**Raw L1 response from RAG:**")
-                st.text(l1["_raw"])
-            else:
-                reason = l1.get("escalation_reason", "")
-                if reason:
-                    st.warning(f"**Escalation reason:** {reason}")
-                if l1.get("root_cause"):
-                    st.info(f"**Root cause:** {l1['root_cause']}")
+    st.markdown("---")
 
-    # ── RAG Debug tab ─────────────────────────────────────────────────────
-    debug_tab = t2 if decision == "L1_FIX_AVAILABLE" and "_raw" not in l1 else t3
-    with debug_tab:
-        st.markdown(f"**RAG endpoint called:** `{_rag_url()}`")
-        st.markdown(f"**History turns sent:** `{len(st.session_state.rag_history)}`")
-        if st.session_state.raw_rag_resp:
-            st.markdown("**Full RAG API response:**")
-            st.json(st.session_state.raw_rag_resp)
+    # Debug
+    with st.expander("🔧 Raw RAG response (L1)", expanded=False):
+        st.json(st.session_state.l1_raw_resp)
 
-    # ── Raw JSON tab ──────────────────────────────────────────────────────
-    raw_tab = t3 if decision == "L1_FIX_AVAILABLE" and "_raw" not in l1 else t4
-    with raw_tab:
-        st.markdown("**L1 parsed result:**");  st.json(l1)
-        if st.session_state.l2_filled:
-            st.markdown("**L2 pre-fill:**");   st.json(st.session_state.l2_filled)
+
+# ── STAGE: L2 DONE — show L2 template exactly as returned by RAG ──────────
+elif st.session_state.stage == "l2_done":
+
+    st.markdown("### 📋 Error Log")
+    with st.expander("View submitted log", expanded=False):
+        st.code(st.session_state.log_text, language="text")
+
+    st.markdown("---")
+
+    # L1 summary (collapsed)
+    with st.expander("✅ L1 Resolution that was attempted", expanded=False):
+        st.markdown(st.session_state.l1_answer)
+
+    st.markdown("---")
+
+    # L2 answer — show exactly as received from RAG
+    st.markdown('<div class="l2box">', unsafe_allow_html=True)
+    st.markdown("### 📋 L2 Escalation Template")
+    st.caption("Pre-filled by RAG pipeline · Review · add comments · then submit")
+    st.markdown(st.session_state.l2_answer)
+    st.markdown("</div>", unsafe_allow_html=True)
+
+    st.markdown("---")
+
+    # Additional comments + submit
+    extra = st.text_area(
+        "Add any additional comments before submitting *(optional)*",
+        height=80, key="extra_comments",
+        placeholder="e.g. This started after the deployment on Friday…"
+    )
+
+    col_sub, col_copy, col_raw = st.columns(3)
+
+    if col_sub.button("🚀 Submit to L2 Support Team",
+                      type="primary", use_container_width=True):
+        st.success(
+            "✅ Ticket submitted to L2 queue. "
+            "Wire your Jira agent here to create the ticket automatically."
+        )
+
+    if col_copy.button("📋 Copy Template", use_container_width=True):
+        content = st.session_state.l2_answer
+        if extra: content += f"\n\nAdditional Comments:\n{extra}"
+        st.code(content, language="text")
+
+    # Debug
+    with st.expander("🔧 Raw RAG response (L2)", expanded=False):
+        st.json(st.session_state.l2_raw_resp)
