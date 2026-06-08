@@ -1,393 +1,765 @@
 """
-rag_poc.py — Genie Bot RAG Pipeline PoC
-=======================================
-Tests the full flow: CSV ingestion → FAISS index → query → LLM response
+genie_bot_streamlit_poc.py
+==========================
+Genie Bot L1/L2 RAG PoC — Streamlit App
 
-Usage:
-    pip install langchain langchain-openai langchain-community faiss-cpu openai python-dotenv
-    python rag_poc.py
+Two separate internal endpoints, same JWT auth process:
+  LLM endpoint   → base_url = LLM_BASE_URL,   model = LLM_MODEL
+  Embed endpoint → base_url = EMBED_BASE_URL,  model = EMBED_MODEL
 
-Set your credentials in the CONFIG block below or in a .env file.
+JWT flow (exact match to your code):
+  Step 1 : POST OpenAM auth_url   → tokenId (SSO token)
+  Step 2 : POST tokenTranslator_v2 → issued_token (JWT)
+  Step 3 : JWT injected into extra_headers for BOTH endpoints
+  Step 4 : Auto-refresh every 25 s (token expires at 30 s)
+
+Run:
+    pip install streamlit langchain langchain-community faiss-cpu \
+                openai httpx truststore requests python-dotenv
+    streamlit run genie_bot_streamlit_poc.py
 """
 
-import os
-import csv
-import json
-import textwrap
+# ── stdlib ────────────────────────────────────────────────────────────────
+import asyncio, csv, json, os, ssl, threading, time, uuid
+from datetime import datetime, timezone
 from pathlib import Path
+from typing import Any, Dict, List, Optional, Tuple
 
-# ── pip install these if not already installed ────────────────────────────
+# ── third-party ───────────────────────────────────────────────────────────
+import httpx, requests, streamlit as st, truststore
+from dotenv import load_dotenv
 from langchain.schema import Document
 from langchain.text_splitter import RecursiveCharacterTextSplitter
-from langchain_openai import AzureOpenAIEmbeddings, AzureChatOpenAI
 from langchain_community.vectorstores import FAISS
-from dotenv import load_dotenv
+from openai import AsyncOpenAI, OpenAI
 
-load_dotenv()  # loads .env file if present
+load_dotenv()
 
 # ══════════════════════════════════════════════════════════════════════════
-# CONFIG — fill these in or set as environment variables
+#  CONFIG
 # ══════════════════════════════════════════════════════════════════════════
-CONFIG = {
-    # Azure OpenAI credentials
-    "azure_endpoint":     os.getenv("AZURE_OPENAI_ENDPOINT",    "https://YOUR-RESOURCE.openai.azure.com/"),
-    "azure_api_key":      os.getenv("AZURE_OPENAI_API_KEY",     "YOUR-API-KEY"),
-    "azure_api_version":  os.getenv("AZURE_OPENAI_API_VERSION", "2024-02-01"),
 
-    # Model deployment names (as named in your Azure portal)
-    "llm_deployment":     os.getenv("LLM_DEPLOYMENT",           "gpt-4.1"),
-    "embed_deployment":   os.getenv("EMBEDDING_DEPLOYMENT",     "text-embedding-3-small"),
+# OpenAM / SSO
+USERNAME    = os.getenv("OPENAM_USERNAME", "")
+PASSWORD    = os.getenv("OPENAM_PASSWORD", "")
+FQDN        = os.getenv("FQDN",           "")
+AUTH_URL    = os.getenv("AUTH_URL",        f"https://{FQDN}/openam/json/authenticate")
+JWT_VERSION = os.getenv("JWT_VERSION",    "v2")
+VERIFY_TLS  = os.getenv("VERIFY_TLS",    "true").lower() == "true"
+TOKEN_TTL   = 30
 
-    # Your local SOP CSV file path
-    "sop_csv_path":       "./sop_data.csv",
+# LLM endpoint — OpenAI SDK, custom base_url
+LLM_BASE_URL = os.getenv("LLM_BASE_URL",  "")
+LLM_MODEL    = os.getenv("LLM_MODEL",     "")
+LLM_TEMP     = float(os.getenv("LLM_TEMPERATURE", "0.0"))
 
-    # FAISS index save location
-    "faiss_path":         "./poc_faiss_index",
+# Embedding endpoint — same SDK pattern, different base_url + model
+EMBED_BASE_URL = os.getenv("EMBED_BASE_URL", "")
+EMBED_MODEL    = os.getenv("EMBED_MODEL",    "text-embedding-3-small")
+
+# Local paths
+SOP_CSV_PATH      = os.getenv("SOP_CSV_PATH",      "./sop_data.csv")
+TEMPLATE_CSV_PATH = os.getenv("TEMPLATE_CSV_PATH", "./l2_template.csv")
+FAISS_INDEX_PATH  = os.getenv("FAISS_INDEX_PATH",  "./poc_faiss_index")
+
+# Retrieval thresholds
+SIM_THRESHOLD    = float(os.getenv("SIM_THRESHOLD",    "0.65"))
+HIGH_CONF_THRESH = float(os.getenv("HIGH_CONF_THRESH", "0.80"))
+TOP_K            = int(os.getenv("TOP_K",              "4"))
+
+# CSV column maps — update if your headers differ
+SOP_COLS = {
+    "error_pattern": os.getenv("COL_ERROR_PATTERN", "error_pattern"),
+    "root_cause":    os.getenv("COL_ROOT_CAUSE",    "root_cause"),
+    "fix_steps":     os.getenv("COL_FIX_STEPS",     "fix_steps"),
+    "module":        os.getenv("COL_MODULE",         "module"),
+    "rerun_safe":    os.getenv("COL_RERUN_SAFE",     "rerun_safe"),
+    "sop_ref":       os.getenv("COL_SOP_REF",        "sop_ref"),
+}
+TMPL_COLS = {
+    "field_name":  os.getenv("COL_FIELD_NAME",  "field_name"),
+    "description": os.getenv("COL_DESCRIPTION", "description"),
+    "example":     os.getenv("COL_EXAMPLE",     "example"),
+    "mandatory":   os.getenv("COL_MANDATORY",   "mandatory"),
+}
+
+_JWT_PATHS = {
+    "v1": "/dsp/rest-sts/DSP_iB2B/iB2B_tokenTranslator",
+    "v2": "/dsp/rest-sts/DSP_iB2B/iB2B_tokenTranslator_v2",
 }
 
 # ══════════════════════════════════════════════════════════════════════════
-# EXPECTED CSV COLUMNS
+#  AUTH LAYER — exact replica of your existing functions
 # ══════════════════════════════════════════════════════════════════════════
-# Your CSV should have at minimum these columns (column names are flexible
-# — update CSV_COLUMN_MAP below to match your actual column headers):
-
-CSV_COLUMN_MAP = {
-    "error_pattern":  "error_pattern",   # e.g. "NullReferenceException in DataExtractor"
-    "root_cause":     "root_cause",      # e.g. "Config mapping missing"
-    "fix_steps":      "fix_steps",       # e.g. "Update config file and rerun"
-    "module":         "module",          # e.g. "TradeDataExtractor"  (optional)
-    "rerun_safe":     "rerun_safe",      # e.g. "Yes" / "No"          (optional)
-    "sop_ref":        "sop_ref",         # e.g. "SOP-GBOT-001"        (optional)
-}
-
-# ══════════════════════════════════════════════════════════════════════════
-# TEST QUERIES — paste a real error log or describe an error here
-# ══════════════════════════════════════════════════════════════════════════
-TEST_QUERIES = [
-    "NullReferenceException in TradeDataExtractor module, bot failed at line 142",
-    "Bot timed out while generating the daily P&L report",
-    "Configuration error — entity GBCIB not found in mapping file",
-]
+_llm_client:   Optional[AsyncOpenAI] = None   # singleton
 
 
-# ══════════════════════════════════════════════════════════════════════════
-# STEP 1 — Load and parse SOP CSV
-# ══════════════════════════════════════════════════════════════════════════
-def load_sop_csv(csv_path: str) -> list[Document]:
+def translate_sso_to_jwt(fqdn, sso_token, version="v2",
+                          verify_tls=True, timeout=30) -> str:
+    if version not in _JWT_PATHS:
+        raise ValueError("version must be 'v1' or 'v2'")
+    url     = f"https://{fqdn}{_JWT_PATHS[version]}"
+    resp = requests.post(
+        url, params={"_action": "translate"},
+        headers={"Content-Type": "application/json", "Accept": "application/json"},
+        json={"input_token_state":  {"token_type": "SSOTOKEN", "tokenId": sso_token},
+              "output_token_state": {"token_type": "JWT"}},
+        timeout=timeout, verify=verify_tls,
+    )
+    resp.raise_for_status()
+    data = resp.json()
+    if "issued_token" not in data:
+        raise RuntimeError(f"Missing issued_token in response: {data}")
+    return data["issued_token"]
+
+
+def get_access_token() -> dict:
+    resp = requests.post(
+        AUTH_URL,
+        headers={"Accept-API-Version": "resource=2.0, protocol=1.0",
+                 "Content-Type":       "application/json",
+                 "X-OpenAM-Username":  USERNAME,
+                 "X-OpenAM-Password":  PASSWORD},
+        json={}, timeout=30, verify=VERIFY_TLS,
+    )
+    resp.raise_for_status()
+    data     = resp.json()
+    token_id = data.get("tokenId") or data.get("tokenid", "")
+    jwt      = translate_sso_to_jwt(FQDN, token_id,
+                                    version=JWT_VERSION, verify_tls=VERIFY_TLS)
+    return {"jwt": jwt}
+
+
+def get_token() -> str:
+    return get_access_token().get("jwt", "")
+
+
+def get_default_headers() -> dict:
+    return {"Content-Type":     "application/json",
+            "x-correlation-id": str(uuid.uuid4()),
+            "x-usersession-id": str(uuid.uuid4())}
+
+
+def get_extra_headers(jwt: str) -> dict:
+    # Replace "Authorization" if your internal header key differs
+    return {"Authorization": f"Bearer {jwt}"}
+
+
+def get_httpx_client() -> httpx.AsyncClient:
+    ctx = truststore.SSLContext(ssl.PROTOCOL_TLS_CLIENT)
+    return httpx.AsyncClient(http2=True, verify=ctx)
+
+
+def get_llm_client() -> AsyncOpenAI:
+    """Singleton AsyncOpenAI for LLM endpoint — your get_openai_client() pattern."""
+    global _llm_client
+    if _llm_client is None:
+        _llm_client = AsyncOpenAI(
+            api_key="custom",               # dummy value — your comment
+            http_client=get_httpx_client(),
+            base_url=LLM_BASE_URL,
+            default_headers=get_default_headers(),
+        )
+    return _llm_client
+
+
+def get_embed_client(jwt: str) -> OpenAI:
     """
-    Load SOP CSV into LangChain Documents.
-    Each row becomes one document combining all relevant fields.
+    Sync OpenAI client for embedding endpoint.
+    Same SDK pattern, different base_url + model.
+    JWT injected per-call so it stays fresh (recreated each time).
     """
-    path = Path(csv_path)
-    if not path.exists():
-        print(f"\n⚠  CSV not found at: {csv_path}")
-        print("   Creating a sample CSV so you can see the expected format...\n")
-        _create_sample_csv(csv_path)
-
-    docs = []
-    with open(csv_path, newline="", encoding="utf-8") as f:
-        reader = csv.DictReader(f)
-        headers = reader.fieldnames or []
-
-        print(f"📄 CSV columns detected: {headers}")
-
-        for i, row in enumerate(reader):
-            # Build document text from available columns
-            # Tries your mapped column names, falls back gracefully
-            parts = []
-            for field, col in CSV_COLUMN_MAP.items():
-                val = row.get(col, "").strip()
-                if val:
-                    parts.append(f"{field.replace('_', ' ').title()}: {val}")
-
-            # If mapping didn't work, just use all columns
-            if not parts:
-                parts = [f"{k}: {v}" for k, v in row.items() if v.strip()]
-
-            content = "\n".join(parts)
-            if content.strip():
-                docs.append(Document(
-                    page_content=content,
-                    metadata={
-                        "row_num":      i + 1,
-                        "source":       "sop_csv",
-                        "sop_ref":      row.get(CSV_COLUMN_MAP["sop_ref"], f"ROW-{i+1}"),
-                        "module":       row.get(CSV_COLUMN_MAP["module"], ""),
-                        "rerun_safe":   row.get(CSV_COLUMN_MAP["rerun_safe"], "Unknown"),
-                    }
-                ))
-
-    print(f"✅ Loaded {len(docs)} SOP records from CSV\n")
-    return docs
-
-
-def _create_sample_csv(path: str):
-    """Create a sample CSV if none exists — shows expected format."""
-    sample_rows = [
-        {
-            "error_pattern": "NullReferenceException in TradeDataExtractor",
-            "root_cause":    "Entity config mapping missing in S3 config file",
-            "fix_steps":     "1. Navigate to config folder\n2. Open entity_mappings.json\n3. Add missing entity entry\n4. Save and rerun the bot",
-            "module":        "TradeDataExtractor",
-            "rerun_safe":    "Yes",
-            "sop_ref":       "SOP-GBOT-001",
-        },
-        {
-            "error_pattern": "TimeoutException in ReportGenerator",
-            "root_cause":    "Database query timeout due to large dataset on month-end",
-            "fix_steps":     "1. Wait 10 minutes for DB load to reduce\n2. Rerun bot during off-peak hours\n3. If persists, contact L2",
-            "module":        "ReportGenerator",
-            "rerun_safe":    "Yes",
-            "sop_ref":       "SOP-GBOT-002",
-        },
-        {
-            "error_pattern": "FileNotFoundException in ConfigLoader",
-            "root_cause":    "Config file missing from expected path after environment refresh",
-            "fix_steps":     "1. Check if config file exists at expected path\n2. If missing, copy from backup location\n3. Rerun bot",
-            "module":        "ConfigLoader",
-            "rerun_safe":    "Yes",
-            "sop_ref":       "SOP-GBOT-003",
-        },
-        {
-            "error_pattern": "AuthenticationException in DataConnector",
-            "root_cause":    "Service account credentials expired",
-            "fix_steps":     "Do NOT rerun. Escalate to L2 immediately for credential refresh.",
-            "module":        "DataConnector",
-            "rerun_safe":    "No",
-            "sop_ref":       "SOP-GBOT-004",
-        },
-    ]
-    with open(path, "w", newline="", encoding="utf-8") as f:
-        w = csv.DictWriter(f, fieldnames=list(sample_rows[0].keys()))
-        w.writeheader()
-        w.writerows(sample_rows)
-    print(f"   ✅ Sample CSV created at: {path}")
-    print(f"   👉 Replace with your real SOP data and rerun\n")
-
-
-# ══════════════════════════════════════════════════════════════════════════
-# STEP 2 — Build FAISS index (or load existing)
-# ══════════════════════════════════════════════════════════════════════════
-def get_or_build_index(docs: list[Document]) -> FAISS:
-    """
-    If FAISS index already exists on disk, load it.
-    Otherwise embed all docs and build fresh index.
-    """
-    embeddings = AzureOpenAIEmbeddings(
-        azure_deployment=CONFIG["embed_deployment"],
-        azure_endpoint=CONFIG["azure_endpoint"],
-        api_key=CONFIG["azure_api_key"],
-        api_version=CONFIG["azure_api_version"],
+    return OpenAI(
+        api_key="custom",
+        base_url=EMBED_BASE_URL,
+        default_headers={**get_default_headers(), **get_extra_headers(jwt)},
     )
 
-    faiss_path = CONFIG["faiss_path"]
 
-    if Path(faiss_path).exists():
-        print(f"📦 Loading existing FAISS index from {faiss_path}...")
-        vs = FAISS.load_local(faiss_path, embeddings, allow_dangerous_deserialization=True)
-        print(f"✅ Index loaded\n")
-        return vs
+# ══════════════════════════════════════════════════════════════════════════
+#  extract_message_content — exact replica of your function
+# ══════════════════════════════════════════════════════════════════════════
+def extract_message_content(message_content: Any) -> str:
+    if isinstance(message_content, str):
+        return message_content
+    if isinstance(message_content, list):
+        parts = []
+        for item in message_content:
+            if isinstance(item, dict):
+                if item.get("type") == "text" and item.get("text"):
+                    parts.append(item["text"])
+                elif item.get("type") == "output" and item.get("output"):
+                    parts.append(item["output"])
+            else:
+                itype = getattr(item, "type", None)
+                itext = getattr(item, "text", None) or getattr(item, "output", None)
+                if itype in ("text", "output") and itext:
+                    parts.append(itext)
+        return "".join(parts)
+    if hasattr(message_content, "content"):
+        c = message_content.content
+        if isinstance(c, str):  return c
+        if isinstance(c, list): return extract_message_content(c)
+    return ""
 
-    print(f"🔨 Building new FAISS index (embedding {len(docs)} documents)...")
-    print(f"   Model: {CONFIG['embed_deployment']}")
 
-    # Chunk documents for better retrieval
-    splitter = RecursiveCharacterTextSplitter(chunk_size=400, chunk_overlap=40)
-    chunks   = splitter.split_documents(docs)
-    print(f"   Chunked into {len(chunks)} segments")
+# ══════════════════════════════════════════════════════════════════════════
+#  JWT AUTO-REFRESH — background thread, 30 s TTL
+# ══════════════════════════════════════════════════════════════════════════
+class JWTManager:
+    def __init__(self):
+        self._token       = ""
+        self._expires_at  = 0.0
+        self._lock        = threading.Lock()
+        self._thread      = None
+        self._running     = False
+        self.last_refresh = "Never"
+        self.last_error   = ""
+        self.refresh_count = 0
 
-    vs = FAISS.from_documents(chunks, embeddings)
-    vs.save_local(faiss_path)
-    print(f"✅ FAISS index built and saved to {faiss_path}\n")
+    @property
+    def token(self):
+        with self._lock: return self._token
+
+    @property
+    def is_valid(self):
+        with self._lock:
+            return bool(self._token) and time.time() < self._expires_at
+
+    @property
+    def seconds_remaining(self):
+        with self._lock: return max(0, int(self._expires_at - time.time()))
+
+    def start(self):
+        self._fetch()
+        self._running = True
+        self._thread  = threading.Thread(target=self._loop, daemon=True)
+        self._thread.start()
+
+    def stop(self):    self._running = False
+    def refresh(self): self._fetch()
+
+    def _loop(self):
+        while self._running:
+            time.sleep(max(TOKEN_TTL - 5, 5))
+            self._fetch()
+
+    def _fetch(self):
+        try:
+            tok = get_token()
+            with self._lock:
+                self._token       = tok
+                self._expires_at  = time.time() + TOKEN_TTL
+                self.last_refresh = datetime.now(timezone.utc).strftime("%H:%M:%S UTC")
+                self.last_error   = ""
+                self.refresh_count += 1
+        except Exception as e:
+            with self._lock: self.last_error = str(e)
+
+
+# ══════════════════════════════════════════════════════════════════════════
+#  LLM CALL — mirrors your exact call pattern
+# ══════════════════════════════════════════════════════════════════════════
+async def _llm_async(messages: list, jwt: str, max_tokens: int = 2000) -> str:
+    extra_headers = get_extra_headers(jwt)      # fresh JWT per call
+    client        = get_llm_client()            # singleton
+
+    result = await client.chat.completions.create(
+        model=LLM_MODEL,
+        messages=messages,
+        max_completion_tokens=max_tokens,
+        extra_headers=extra_headers,
+        user="",
+        temperature=LLM_TEMP,
+    )
+    return extract_message_content(result.choices[0].message.content)
+
+
+def call_llm(messages: list, jwt: str, max_tokens: int = 2000) -> str:
+    return asyncio.run(_llm_async(messages, jwt, max_tokens))
+
+
+# ══════════════════════════════════════════════════════════════════════════
+#  EMBEDDINGS — same SDK, EMBED_BASE_URL + EMBED_MODEL + JWT
+# ══════════════════════════════════════════════════════════════════════════
+class InternalEmbeddings:
+    """LangChain-compatible embeddings using your internal embed endpoint."""
+
+    def __init__(self, jm: JWTManager):
+        self.jm = jm
+
+    def _client(self): return get_embed_client(self.jm.token)
+
+    def embed_documents(self, texts: List[str]) -> List[List[float]]:
+        resp = self._client().embeddings.create(input=texts, model=EMBED_MODEL)
+        return [item.embedding for item in resp.data]
+
+    def embed_query(self, text: str) -> List[float]:
+        return self.embed_documents([text])[0]
+
+
+# ══════════════════════════════════════════════════════════════════════════
+#  FAISS
+# ══════════════════════════════════════════════════════════════════════════
+def build_or_load_faiss(docs: List[Document], jm: JWTManager) -> FAISS:
+    emb = InternalEmbeddings(jm)
+    if Path(FAISS_INDEX_PATH).exists():
+        return FAISS.load_local(FAISS_INDEX_PATH, emb,
+                                allow_dangerous_deserialization=True)
+    chunks = RecursiveCharacterTextSplitter(
+        chunk_size=400, chunk_overlap=40
+    ).split_documents(docs)
+    vs = FAISS.from_documents(chunks, emb)
+    vs.save_local(FAISS_INDEX_PATH)
     return vs
 
 
-# ══════════════════════════════════════════════════════════════════════════
-# STEP 3 — Retrieve similar SOPs for a query
-# ══════════════════════════════════════════════════════════════════════════
-def retrieve(vs: FAISS, query: str, top_k: int = 3) -> list[tuple]:
-    """
-    Embed query and find top-k most similar SOP entries.
-    Returns list of (Document, similarity_score) tuples.
-    """
-    results = vs.similarity_search_with_relevance_scores(query, k=top_k)
-    return results
+def rebuild_faiss(docs: List[Document], jm: JWTManager) -> FAISS:
+    import shutil
+    if Path(FAISS_INDEX_PATH).exists(): shutil.rmtree(FAISS_INDEX_PATH)
+    return build_or_load_faiss(docs, jm)
 
 
 # ══════════════════════════════════════════════════════════════════════════
-# STEP 4 — Call GPT-4.1 with retrieved context
+#  DATA LOADING
 # ══════════════════════════════════════════════════════════════════════════
-SYSTEM_PROMPT = """You are a deterministic L1 triage agent for Genie Bot production support.
-Analyse the user's error against the retrieved SOP entries and respond with structured JSON.
+def _make_sample_sop():
+    rows = [
+        {"error_pattern":"NullReferenceException in TradeDataExtractor",
+         "root_cause":"Entity config mapping missing","fix_steps":
+         "1. Open entity_mappings.json\n2. Add missing entity\n3. Save\n4. Rerun bot",
+         "module":"TradeDataExtractor","rerun_safe":"Yes","sop_ref":"SOP-GBOT-001"},
+        {"error_pattern":"TimeoutException in ReportGenerator",
+         "root_cause":"DB query timeout on month-end","fix_steps":
+         "1. Wait 10 minutes\n2. Rerun off-peak\n3. Escalate if persists",
+         "module":"ReportGenerator","rerun_safe":"Yes","sop_ref":"SOP-GBOT-002"},
+        {"error_pattern":"FileNotFoundException in ConfigLoader",
+         "root_cause":"Config file missing after refresh","fix_steps":
+         "1. Check config path\n2. Copy from backup\n3. Rerun",
+         "module":"ConfigLoader","rerun_safe":"Yes","sop_ref":"SOP-GBOT-003"},
+        {"error_pattern":"AuthenticationException in DataConnector",
+         "root_cause":"Service account credentials expired","fix_steps":
+         "Do NOT rerun. Escalate to L2 immediately.",
+         "module":"DataConnector","rerun_safe":"No","sop_ref":"SOP-GBOT-004"},
+        {"error_pattern":"DatabaseException in DataValidator",
+         "root_cause":"Schema mismatch after deployment","fix_steps":
+         "Do NOT rerun. Escalate — schema rollback may be needed.",
+         "module":"DataValidator","rerun_safe":"No","sop_ref":"SOP-GBOT-005"},
+    ]
+    with open(SOP_CSV_PATH, "w", newline="", encoding="utf-8") as f:
+        w = csv.DictWriter(f, fieldnames=list(rows[0].keys()))
+        w.writeheader(); w.writerows(rows)
 
-RULES:
-- Temperature=0. Only use information from the retrieved SOPs. Never invent fixes.
-- plain_english_fix must be written for a non-technical business user. No jargon. No code.
-- rerun_safe=true ONLY if the SOP explicitly says the fix is safe to rerun.
-- If no good match is found, set decision to ESCALATE.
 
-Respond ONLY with valid JSON:
+def _make_sample_template():
+    rows = [
+        {"field_name":"Error Summary",       "description":"One-line plain English description",         "example":"NullReferenceException in TradeDataExtractor for GBCIB","mandatory":"Yes"},
+        {"field_name":"Affected Module",     "description":"Which module failed",                         "example":"TradeDataExtractor","mandatory":"Yes"},
+        {"field_name":"Error Classification","description":"Error category",                              "example":"Configuration / Timeout / Null Reference","mandatory":"Yes"},
+        {"field_name":"Priority",            "description":"Severity based on business impact",           "example":"High / Medium / Low","mandatory":"Yes"},
+        {"field_name":"Root Cause",          "description":"AI-diagnosed root cause",                     "example":"Missing entity mapping","mandatory":"Yes"},
+        {"field_name":"L1 Fix Attempted",    "description":"Was L1 fix tried before escalation?",        "example":"Yes — config checked, issue persisted","mandatory":"Yes"},
+        {"field_name":"Stack Trace Summary", "description":"Plain English stack trace summary",           "example":"Failed at DataExtractor.Execute() line 142","mandatory":"Yes"},
+        {"field_name":"SOP Reference",       "description":"Matching SOP if found",                      "example":"SOP-GBOT-001","mandatory":"No"},
+        {"field_name":"Run ID",              "description":"Unique run ID from the error screen",         "example":"GBT-20260527-0042","mandatory":"Yes"},
+        {"field_name":"Bot Version",         "description":"Genie Bot version at failure",                "example":"v2.1.4","mandatory":"No"},
+        {"field_name":"User Comments",       "description":"Additional user context",                     "example":"Started after Friday deployment","mandatory":"No"},
+    ]
+    with open(TEMPLATE_CSV_PATH, "w", newline="", encoding="utf-8") as f:
+        w = csv.DictWriter(f, fieldnames=list(rows[0].keys()))
+        w.writeheader(); w.writerows(rows)
+
+
+def load_data() -> Tuple[List[Document], List[dict], List[str]]:
+    created = []
+    if not Path(SOP_CSV_PATH).exists():
+        _make_sample_sop();      created.append(f"Sample SOP created → {SOP_CSV_PATH}")
+    if not Path(TEMPLATE_CSV_PATH).exists():
+        _make_sample_template(); created.append(f"Sample template created → {TEMPLATE_CSV_PATH}")
+
+    sop_docs = []
+    with open(SOP_CSV_PATH, newline="", encoding="utf-8") as f:
+        for i, row in enumerate(csv.DictReader(f)):
+            parts = []
+            for field, col in SOP_COLS.items():
+                val = row.get(col, "").strip()
+                if val: parts.append(f"{field.replace('_',' ').title()}: {val}")
+            if not parts:
+                parts = [f"{k}: {v}" for k, v in row.items() if v.strip()]
+            sop_docs.append(Document(
+                page_content="\n".join(parts),
+                metadata={"source":"sop",
+                          "sop_ref":    row.get(SOP_COLS["sop_ref"],    f"ROW-{i+1}"),
+                          "module":     row.get(SOP_COLS["module"],     ""),
+                          "rerun_safe": row.get(SOP_COLS["rerun_safe"], "Unknown"),
+                          "fix_steps":  row.get(SOP_COLS["fix_steps"],  "")}))
+
+    template_fields = []
+    with open(TEMPLATE_CSV_PATH, newline="", encoding="utf-8") as f:
+        for row in csv.DictReader(f):
+            template_fields.append({
+                "field":       row.get(TMPL_COLS["field_name"],  ""),
+                "description": row.get(TMPL_COLS["description"], ""),
+                "example":     row.get(TMPL_COLS["example"],     ""),
+                "mandatory":   row.get(TMPL_COLS["mandatory"],   "No"),
+            })
+    return sop_docs, template_fields, created
+
+
+# ══════════════════════════════════════════════════════════════════════════
+#  PROMPTS + DIAGNOSIS
+# ══════════════════════════════════════════════════════════════════════════
+L1_SYS = """You are a deterministic L1 triage agent for Genie Bot production support.
+Analyse the error log against retrieved SOP entries. Temperature=0. Only use SOP info.
+plain_english_fix: numbered steps for a NON-TECHNICAL business user. No jargon.
+rerun_safe: true ONLY if SOP says safe to rerun.
+If no strong match → decision = ESCALATE.
+Respond ONLY with valid JSON (no markdown fences):
 {
   "decision": "L1_FIX_AVAILABLE" or "ESCALATE",
   "confidence": "HIGH" or "MEDIUM" or "LOW",
-  "root_cause": "plain English explanation of what went wrong",
-  "plain_english_fix": "numbered steps a non-technical user can follow",
+  "root_cause": "plain English root cause",
+  "plain_english_fix": "numbered steps for non-IT user",
+  "technical_fix": "technical steps for L2 reference",
   "rerun_safe": true or false,
-  "sop_reference": "SOP ref if found, else null",
-  "reasoning": "brief explanation of why this decision was made"
+  "sop_reference": "SOP ref or null",
+  "citations": ["SOP-GBOT-001"],
+  "escalation_reason": "reason if ESCALATE else null"
 }"""
 
+L2_SYS = """You are an L2 escalation template pre-fill agent for Genie Bot support.
+Pre-fill every template field from the error log and L1 diagnosis.
+Respond ONLY with valid JSON — keys = field names, values = pre-filled content."""
 
-def call_llm(query: str, retrieved_docs: list[tuple]) -> dict:
-    """
-    Send query + retrieved SOP context to GPT-4.1.
-    Returns parsed JSON response.
-    """
-    llm = AzureChatOpenAI(
-        azure_deployment=CONFIG["llm_deployment"],
-        azure_endpoint=CONFIG["azure_endpoint"],
-        api_key=CONFIG["azure_api_key"],
-        api_version=CONFIG["azure_api_version"],
-        temperature=0.0,     # Always 0 — deterministic
-        max_tokens=800,
-    )
 
-    # Build context string from retrieved SOPs
-    context_parts = []
-    for i, (doc, score) in enumerate(retrieved_docs, 1):
-        context_parts.append(
-            f"--- SOP Match {i} (similarity score: {score:.3f}) ---\n"
-            f"{doc.page_content}"
-        )
-    context_str = "\n\n".join(context_parts)
+def _parse_json(raw: str) -> dict:
+    clean = raw.strip().lstrip("```json").lstrip("```").rstrip("```").strip()
+    try:    return json.loads(clean)
+    except: return {"_parse_error": raw[:500]}
 
-    user_message = (
-        f"ERROR LOG / QUERY:\n{query}\n\n"
-        f"RETRIEVED SOP ENTRIES:\n{context_str}\n\n"
-        f"Provide your JSON diagnosis now."
-    )
 
-    response = llm.invoke([
-        ("system", SYSTEM_PROMPT),
-        ("human",  user_message),
-    ])
+def run_l1(log_text: str, retrieved: list, jwt: str) -> dict:
+    ctx = "\n\n".join(
+        f"--- SOP {i} (score={s:.3f}, ref={d.metadata.get('sop_ref','?')}) ---\n{d.page_content}"
+        for i,(d,s) in enumerate(retrieved, 1))
+    return _parse_json(call_llm([
+        {"role":"system","content":L1_SYS},
+        {"role":"user",  "content":f"ERROR LOG:\n{log_text[:2000]}\n\nSOPs:\n{ctx}\n\nJSON:"},
+    ], jwt, max_tokens=900))
 
-    raw = response.content.strip()
 
-    # Parse JSON — handle cases where model adds markdown fences
-    clean = raw.lstrip("```json").lstrip("```").rstrip("```").strip()
-    try:
-        return json.loads(clean)
-    except json.JSONDecodeError:
-        return {
-            "decision":         "ESCALATE",
-            "confidence":       "LOW",
-            "root_cause":       "Could not parse LLM response",
-            "plain_english_fix":"Please escalate to the support team.",
-            "rerun_safe":       False,
-            "sop_reference":    None,
-            "reasoning":        f"JSON parse failed. Raw response: {raw[:200]}",
-        }
+def run_l2(log_text: str, tmpl_fields: list, l1: dict, jwt: str) -> dict:
+    fdesc = "\n".join(
+        f"- {f['field']} ({'mandatory' if f['mandatory']=='Yes' else 'optional'}): "
+        f"{f['description']}. e.g. {f['example']}" for f in tmpl_fields)
+    return _parse_json(call_llm([
+        {"role":"system","content":L2_SYS},
+        {"role":"user",  "content":
+            f"ERROR LOG:\n{log_text[:1500]}\n\nL1:\n{json.dumps(l1,indent=2)}\n\n"
+            f"FIELDS:\n{fdesc}\n\nJSON:"},
+    ], jwt, max_tokens=1200))
 
 
 # ══════════════════════════════════════════════════════════════════════════
-# STEP 5 — Pretty-print the full result
+#  STREAMLIT UI
 # ══════════════════════════════════════════════════════════════════════════
-def print_result(query: str, retrieved: list[tuple], llm_response: dict):
-    """Print a clean, readable summary of the full RAG pipeline result."""
-    w = 70
-    print("=" * w)
-    print("QUERY:")
-    print(textwrap.fill(query, width=w, initial_indent="  "))
-    print()
+st.set_page_config(page_title="Genie Bot AI Support", page_icon="🤖",
+                   layout="wide", initial_sidebar_state="expanded")
 
-    print("── RETRIEVED SOP MATCHES ──────────────────────────────────────")
-    for i, (doc, score) in enumerate(retrieved, 1):
-        colour = "✅" if score >= 0.75 else "🟡" if score >= 0.50 else "❌"
-        print(f"  {colour} Match {i}: score={score:.4f}  ref={doc.metadata.get('sop_ref','?')}")
-        # Show first line of the SOP content
-        first_line = doc.page_content.split("\n")[0]
-        print(f"     {first_line[:80]}")
-    print()
+st.markdown("""<style>
+.block-container{padding-top:1.4rem}
+.stTextArea textarea{font-family:monospace;font-size:12px}
+.l1box{background:#f0fdf4;border-left:4px solid #16a34a;border-radius:6px;padding:16px 20px;margin:10px 0}
+.l2box{background:#eff6ff;border-left:4px solid #2563eb;border-radius:6px;padding:16px 20px;margin:10px 0}
+.warnbox{background:#fefce8;border-left:4px solid #ca8a04;border-radius:6px;padding:12px 16px;margin:8px 0}
+.endpts{background:#f8fafc;border:1px solid #e2e8f0;border-radius:6px;padding:10px 14px;font-size:11px;font-family:monospace}
+</style>""", unsafe_allow_html=True)
 
-    print("── LLM RESPONSE (GPT-4.1) ─────────────────────────────────────")
-    decision = llm_response.get("decision", "?")
-    conf     = llm_response.get("confidence", "?")
-    icon     = "✅" if decision == "L1_FIX_AVAILABLE" else "🔴"
-    print(f"  {icon} Decision:    {decision}  ({conf} confidence)")
-    print()
+# Session state
+for k, v in {"jwt_manager":None,"jwt_started":False,"faiss_index":None,
+              "sop_docs":[],"template_fields":[],"data_loaded":False,
+              "result":None,"l2_filled":None,
+              "sim_threshold":SIM_THRESHOLD,"hi_conf":HIGH_CONF_THRESH,"top_k":TOP_K}.items():
+    if k not in st.session_state: st.session_state[k] = v
 
-    root = llm_response.get("root_cause", "")
-    if root:
-        print(f"  Root Cause:")
-        print(textwrap.fill(root, width=w, initial_indent="    "))
-        print()
+if st.session_state.jwt_manager is None:
+    st.session_state.jwt_manager = JWTManager()
 
-    fix = llm_response.get("plain_english_fix", "")
-    if fix:
-        print(f"  Fix (plain English for user):")
-        for line in fix.split("\n"):
-            print(f"    {line}")
-        print()
+jm: JWTManager = st.session_state.jwt_manager
 
-    print(f"  Rerun Safe:   {'Yes ✅' if llm_response.get('rerun_safe') else 'No ❌ — manual rerun only'}")
-    print(f"  SOP Ref:      {llm_response.get('sop_reference') or 'None found'}")
+# ══════ SIDEBAR ═══════════════════════════════════════════════════════════
+with st.sidebar:
+    st.markdown("## ⚙️ Setup")
 
-    reasoning = llm_response.get("reasoning", "")
-    if reasoning:
-        print(f"\n  Reasoning:    {reasoning[:120]}")
+    # Endpoint summary
+    st.markdown("### 🔌 Endpoints")
+    st.markdown(f"""<div class="endpts">
+<b>LLM</b><br/>
+{LLM_BASE_URL or '⚠ LLM_BASE_URL not set'}<br/>
+model: {LLM_MODEL or '⚠ LLM_MODEL not set'}<br/><br/>
+<b>Embeddings</b> (same SDK, different base_url)<br/>
+{EMBED_BASE_URL or '⚠ EMBED_BASE_URL not set'}<br/>
+model: {EMBED_MODEL}<br/><br/>
+<b>Auth (OpenAM → JWT)</b><br/>
+{AUTH_URL or '⚠ AUTH_URL not set'} → v{JWT_VERSION}
+</div>""", unsafe_allow_html=True)
 
-    print("=" * w)
-    print()
+    st.divider()
+
+    # JWT
+    st.markdown(f"### 🔐 JWT  `30s TTL`")
+    if not st.session_state.jwt_started:
+        st.info("Authenticates via OpenAM → SSO → JWT.\nSame token used for both endpoints.")
+        if st.button("▶ Start JWT", type="primary", use_container_width=True):
+            with st.spinner("OpenAM → SSO token → JWT…"):
+                try:
+                    jm.start()
+                    st.session_state.jwt_started = True
+                    st.rerun()
+                except Exception as e:
+                    st.error(f"Auth failed: {e}")
+    else:
+        secs = jm.seconds_remaining
+        if jm.is_valid:
+            col = "🟢" if secs > 10 else "🟡"
+            st.success(f"{col} Active — **{secs}s** left")
+        else:
+            st.error("🔴 Expired")
+
+        c1, c2 = st.columns(2)
+        if c1.button("🔄 Refresh", use_container_width=True):
+            with st.spinner("Refreshing…"):
+                jm.refresh()
+            st.rerun()
+        if c2.button("⏹ Stop", use_container_width=True):
+            jm.stop(); st.session_state.jwt_started = False; st.rerun()
+
+        st.caption(f"Last: {jm.last_refresh}  |  #{jm.refresh_count}")
+        if jm.last_error: st.error(f"⚠ {jm.last_error[:100]}")
+        if jm.token:
+            tok = jm.token
+            st.code(tok[:16] + "…" + tok[-6:], language=None)
+        st.caption(f"Auto-refreshes every {TOKEN_TTL-5}s  |  same token → LLM + embed")
+
+    st.divider()
+
+    # Data
+    st.markdown("### 📂 SOP Data & FAISS")
+    sop_path  = st.text_input("SOP CSV",      value=SOP_CSV_PATH)
+    tmpl_path = st.text_input("Template CSV", value=TEMPLATE_CSV_PATH)
+
+    c1, c2 = st.columns(2)
+    load_btn    = c1.button("Load",    use_container_width=True, disabled=not st.session_state.jwt_started)
+    rebuild_btn = c2.button("Rebuild", use_container_width=True, disabled=not st.session_state.jwt_started)
+    if not st.session_state.jwt_started:
+        st.caption("⚠ Start JWT first — embeddings need the token")
+
+    if load_btn or rebuild_btn:
+        with st.spinner("Loading CSVs…"):
+            docs, tmpl, created = load_data()
+            st.session_state.sop_docs = docs
+            st.session_state.template_fields = tmpl
+        with st.spinner(f"Embedding via {EMBED_BASE_URL}…"):
+            try:
+                st.session_state.faiss_index = (
+                    rebuild_faiss(docs, jm) if rebuild_btn else build_or_load_faiss(docs, jm)
+                )
+                st.session_state.data_loaded = True
+            except Exception as e:
+                st.error(f"FAISS error: {e}")
+        for m in created: st.info(f"📄 {m}")
+        if st.session_state.data_loaded:
+            vs = st.session_state.faiss_index
+            st.success(f"✅ {len(docs)} SOPs | {vs.index.ntotal} vectors | {len(tmpl)} template fields")
+
+    if st.session_state.data_loaded:
+        st.caption(f"FAISS: {st.session_state.faiss_index.index.ntotal} vectors ready")
+
+    st.divider()
+
+    # Thresholds
+    st.markdown("### 🎚 Retrieval")
+    st.session_state.sim_threshold = st.slider("L1 match threshold",
+        0.40, 0.95, st.session_state.sim_threshold, 0.05,
+        help="Below this → direct L2 escalation")
+    st.session_state.hi_conf  = st.slider("High confidence",
+        0.60, 0.99, st.session_state.hi_conf, 0.05)
+    st.session_state.top_k    = st.slider("Top-K SOPs", 1, 8, st.session_state.top_k)
+    st.divider()
+    st.caption("🔒 Genie Bot AI Copilot · PoC")
 
 
-# ══════════════════════════════════════════════════════════════════════════
-# MAIN
-# ══════════════════════════════════════════════════════════════════════════
-def main():
-    print("\n🤖 Genie Bot RAG Pipeline — PoC Test")
-    print("=" * 70)
-    print(f"  LLM:        {CONFIG['llm_deployment']} on Azure OpenAI")
-    print(f"  Embeddings: {CONFIG['embed_deployment']}")
-    print(f"  SOP CSV:    {CONFIG['sop_csv_path']}")
-    print("=" * 70)
-    print()
+# ══════ MAIN ══════════════════════════════════════════════════════════════
+st.title("🤖 Genie Bot AI Support Copilot")
+st.caption("Paste or upload an error log → L1 fix (if SOP match) or pre-filled L2 template")
 
-    # Step 1: Load SOP CSV
-    docs = load_sop_csv(CONFIG["sop_csv_path"])
-    if not docs:
-        print("❌ No documents loaded. Check your CSV path and column names.")
-        return
+if not st.session_state.data_loaded:
+    for num, (flag, label) in {
+        "1":("jwt_started",  "Start JWT manager in the sidebar"),
+        "2":("data_loaded",  "Load SOP data from the sidebar"),
+        "3":(None,           "Paste a log and click Diagnose"),
+    }.items():
+        done = flag and st.session_state.get(flag)
+        st.markdown(f"{'✅' if done else '○'} **Step {num}:** {label}")
 
-    # Step 2: Build / load FAISS index
-    vs = get_or_build_index(docs)
+# Input
+tab_paste, tab_upload = st.tabs(["📋 Paste Log", "📁 Upload Log File"])
+log_text = ""
 
-    # Step 3–5: Run each test query through the full pipeline
-    print(f"\n🔍 Running {len(TEST_QUERIES)} test queries...\n")
+with tab_paste:
+    log_text = st.text_area("Paste Genie Bot error log", height=220,
+        placeholder=(
+            "[2026-05-27 09:14:32 UTC] RUN_ID=GBT-20260527-0042 ENV=PROD\n"
+            "[ERROR] Module: TradeDataExtractor | Exit: FAILED\n"
+            "[ERROR] System.NullReferenceException: Object reference not set\n"
+            "   at GeniBot.Core.DataExtractor.Execute() line 142\n"
+            "[INPUT] Entity=GBCIB | ReportDate=2026-05-27"),
+        key="log_paste")
 
-    for i, query in enumerate(TEST_QUERIES, 1):
-        print(f"\n{'━'*70}")
-        print(f"  Test {i} of {len(TEST_QUERIES)}")
-        print(f"{'━'*70}")
+with tab_upload:
+    uploaded = st.file_uploader("Upload .log / .txt", type=["log","txt"])
+    if uploaded:
+        log_text = uploaded.read().decode("utf-8", errors="replace")
+        st.text_area("Preview", value=log_text[:600]+("…" if len(log_text)>600 else ""),
+                     height=140, disabled=True)
 
-        # Retrieve
-        retrieved = retrieve(vs, query, top_k=3)
+# Buttons
+ready = st.session_state.data_loaded and st.session_state.jwt_started and jm.is_valid
+col_btn, col_clr = st.columns([4, 1])
+diag_btn = col_btn.button("🔍 Diagnose Issue", type="primary",
+                           use_container_width=True, disabled=not ready)
+if not ready:
+    hint = ("Start JWT first" if not st.session_state.jwt_started
+            else "Load SOP data first" if not st.session_state.data_loaded
+            else "JWT expired — force refresh")
+    col_btn.caption(f"⚠ {hint}")
+if col_clr.button("🗑 Clear", use_container_width=True):
+    st.session_state.result = st.session_state.l2_filled = None
+    st.rerun()
 
-        # Call LLM
-        print(f"  ⏳ Calling GPT-4.1...")
-        llm_resp = call_llm(query, retrieved)
+# Run
+if diag_btn:
+    if not log_text.strip():
+        st.warning("Please paste or upload an error log first.")
+    else:
+        jwt = jm.token
+        vs  = st.session_state.faiss_index
 
-        # Print
-        print_result(query, retrieved, llm_resp)
+        with st.spinner("🔍 Searching local FAISS index…"):
+            retrieved = vs.similarity_search_with_relevance_scores(
+                log_text[:1500], k=st.session_state.top_k)
+        top_score = retrieved[0][1] if retrieved else 0.0
 
-    print("\n✅ PoC complete. All queries processed.\n")
-    print("💡 Next steps:")
-    print("   1. Replace TEST_QUERIES with real Genie Bot error logs")
-    print("   2. Update CSV_COLUMN_MAP to match your actual CSV headers")
-    print("   3. Add more SOP rows to improve retrieval accuracy")
-    print("   4. Tune similarity thresholds (currently 0.75 = match)")
-    print()
+        with st.spinner(f"🤖 Calling LLM ({LLM_MODEL})…"):
+            l1 = run_l1(log_text, retrieved, jwt)
+
+        if top_score < st.session_state.sim_threshold:
+            l1["decision"] = "ESCALATE"
+            l1["escalation_reason"] = (
+                l1.get("escalation_reason") or
+                f"Top score {top_score:.4f} < threshold {st.session_state.sim_threshold}")
+
+        l2 = None
+        if l1.get("decision") == "ESCALATE":
+            with st.spinner("📋 Pre-filling L2 template…"):
+                l2 = run_l2(log_text, st.session_state.template_fields, l1, jwt)
+
+        st.session_state.result   = {"l1":l1,"retrieved":retrieved,"top_score":top_score}
+        st.session_state.l2_filled = l2
 
 
-if __name__ == "__main__":
-    main()
+# Results
+if st.session_state.result:
+    r         = st.session_state.result
+    l1        = r["l1"]
+    retrieved = r["retrieved"]
+    top_score = r["top_score"]
+    decision  = l1.get("decision","ESCALATE")
+    conf      = l1.get("confidence","LOW")
+    ci        = {"HIGH":"🟢","MEDIUM":"🟡","LOW":"🔴"}.get(conf,"⚪")
+
+    st.markdown("---")
+    c1,c2,c3,c4 = st.columns(4)
+    c1.metric("Decision",      "✅ L1 Fix" if decision=="L1_FIX_AVAILABLE" else "🔴 Escalate")
+    c2.metric("Confidence",    f"{ci} {conf}")
+    c3.metric("Top Similarity",f"{top_score:.4f}")
+    c4.metric("SOP Match",     l1.get("sop_reference") or "None")
+    st.markdown("---")
+
+    tabs = (st.tabs(["✅ L1 Fix","🔍 Retrieved SOPs","🔧 Raw JSON"])
+            if decision=="L1_FIX_AVAILABLE"
+            else st.tabs(["📋 L2 Template","❌ Why Escalated","🔍 Retrieved SOPs","🔧 Raw JSON"]))
+
+    # L1 Fix
+    if decision == "L1_FIX_AVAILABLE":
+        with tabs[0]:
+            st.markdown('<div class="l1box">', unsafe_allow_html=True)
+            st.markdown(f"### ✅ L1 Fix Found — **{conf}** confidence")
+            if l1.get("root_cause"):
+                st.markdown("**🔍 Root Cause**"); st.info(l1["root_cause"])
+            if l1.get("plain_english_fix"):
+                st.markdown("**🔧 Steps (plain English)**")
+                for line in l1["plain_english_fix"].split("\n"):
+                    if line.strip(): st.write(line)
+            rerun = l1.get("rerun_safe", False)
+            st.markdown(f"**Rerun Safe:** {'✅ Yes — apply fix then re-run manually' if rerun else '❌ No — do NOT rerun'}")
+            if l1.get("sop_reference"): st.caption(f"SOP: `{l1['sop_reference']}`")
+            if l1.get("citations"):     st.caption(f"Based on: {', '.join(l1['citations'])}")
+            st.markdown("</div>", unsafe_allow_html=True)
+            if l1.get("technical_fix"):
+                with st.expander("🛠 Technical details (L2 reference)"):
+                    st.text(l1["technical_fix"])
+
+    # L2 Template
+    if decision == "ESCALATE":
+        with tabs[0]:
+            st.markdown('<div class="l2box">', unsafe_allow_html=True)
+            st.markdown("### 📋 Pre-filled L2 Escalation Template")
+            st.caption("Review · edit · add comments · then submit")
+            st.markdown("</div>", unsafe_allow_html=True)
+            l2 = st.session_state.l2_filled or {}
+            if "_parse_error" in l2:
+                st.error("Template parse failed"); st.text(l2["_parse_error"])
+            else:
+                filled = {}
+                for fd in st.session_state.template_fields:
+                    fn = fd["field"]
+                    filled[fn] = st.text_area(
+                        f"{fn} {'*(required)*' if fd['mandatory']=='Yes' else ''}",
+                        value=l2.get(fn,""), height=68, key=f"f_{fn}",
+                        help=f"{fd['description']}  |  e.g. {fd['example']}")
+                st.markdown("---")
+                extra = st.text_area("Additional Comments *(optional)*", height=72, key="extra")
+                if extra: filled["User Comments"] = extra
+                cs, cc = st.columns(2)
+                if cs.button("🚀 Submit to L2", type="primary", use_container_width=True):
+                    st.success("✅ Submitted — wire your Jira agent here.")
+                if cc.button("📋 Export JSON", use_container_width=True):
+                    st.code(json.dumps(filled, indent=2), language="json")
+
+        with tabs[1]:
+            if top_score < st.session_state.sim_threshold:
+                st.markdown('<div class="warnbox">', unsafe_allow_html=True)
+                st.markdown(f"No strong SOP match. Top score `{top_score:.4f}` < threshold `{st.session_state.sim_threshold}`.")
+                st.markdown("</div>", unsafe_allow_html=True)
+            reason = l1.get("escalation_reason")
+            if reason: st.warning(f"Escalation reason: {reason}")
+            if l1.get("root_cause"): st.info(l1["root_cause"])
+
+    # Retrieved SOPs
+    with tabs[1 if decision=="L1_FIX_AVAILABLE" else 2]:
+        st.markdown(f"Top **{len(retrieved)}** SOPs  |  threshold: `{st.session_state.sim_threshold}`  |  embed: `{EMBED_BASE_URL}`")
+        for i,(doc,score) in enumerate(retrieved,1):
+            icon = ("🟢" if score>=st.session_state.hi_conf
+                    else "🟡" if score>=st.session_state.sim_threshold else "🔴")
+            with st.expander(
+                f"{icon} Match {i} — score {score:.4f} | {doc.metadata.get('sop_ref','?')} | {doc.metadata.get('module','?')}",
+                expanded=(i==1)):
+                st.text(doc.page_content)
+                st.caption(f"Rerun safe: {doc.metadata.get('rerun_safe','?')}")
+
+    # Raw JSON
+    with tabs[2 if decision=="L1_FIX_AVAILABLE" else 3]:
+        st.markdown("**L1 diagnosis:**"); st.json(l1)
+        if st.session_state.l2_filled:
+            st.markdown("**L2 pre-fill:**"); st.json(st.session_state.l2_filled)
