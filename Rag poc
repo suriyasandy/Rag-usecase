@@ -1,0 +1,393 @@
+"""
+rag_poc.py — Genie Bot RAG Pipeline PoC
+=======================================
+Tests the full flow: CSV ingestion → FAISS index → query → LLM response
+
+Usage:
+    pip install langchain langchain-openai langchain-community faiss-cpu openai python-dotenv
+    python rag_poc.py
+
+Set your credentials in the CONFIG block below or in a .env file.
+"""
+
+import os
+import csv
+import json
+import textwrap
+from pathlib import Path
+
+# ── pip install these if not already installed ────────────────────────────
+from langchain.schema import Document
+from langchain.text_splitter import RecursiveCharacterTextSplitter
+from langchain_openai import AzureOpenAIEmbeddings, AzureChatOpenAI
+from langchain_community.vectorstores import FAISS
+from dotenv import load_dotenv
+
+load_dotenv()  # loads .env file if present
+
+# ══════════════════════════════════════════════════════════════════════════
+# CONFIG — fill these in or set as environment variables
+# ══════════════════════════════════════════════════════════════════════════
+CONFIG = {
+    # Azure OpenAI credentials
+    "azure_endpoint":     os.getenv("AZURE_OPENAI_ENDPOINT",    "https://YOUR-RESOURCE.openai.azure.com/"),
+    "azure_api_key":      os.getenv("AZURE_OPENAI_API_KEY",     "YOUR-API-KEY"),
+    "azure_api_version":  os.getenv("AZURE_OPENAI_API_VERSION", "2024-02-01"),
+
+    # Model deployment names (as named in your Azure portal)
+    "llm_deployment":     os.getenv("LLM_DEPLOYMENT",           "gpt-4.1"),
+    "embed_deployment":   os.getenv("EMBEDDING_DEPLOYMENT",     "text-embedding-3-small"),
+
+    # Your local SOP CSV file path
+    "sop_csv_path":       "./sop_data.csv",
+
+    # FAISS index save location
+    "faiss_path":         "./poc_faiss_index",
+}
+
+# ══════════════════════════════════════════════════════════════════════════
+# EXPECTED CSV COLUMNS
+# ══════════════════════════════════════════════════════════════════════════
+# Your CSV should have at minimum these columns (column names are flexible
+# — update CSV_COLUMN_MAP below to match your actual column headers):
+
+CSV_COLUMN_MAP = {
+    "error_pattern":  "error_pattern",   # e.g. "NullReferenceException in DataExtractor"
+    "root_cause":     "root_cause",      # e.g. "Config mapping missing"
+    "fix_steps":      "fix_steps",       # e.g. "Update config file and rerun"
+    "module":         "module",          # e.g. "TradeDataExtractor"  (optional)
+    "rerun_safe":     "rerun_safe",      # e.g. "Yes" / "No"          (optional)
+    "sop_ref":        "sop_ref",         # e.g. "SOP-GBOT-001"        (optional)
+}
+
+# ══════════════════════════════════════════════════════════════════════════
+# TEST QUERIES — paste a real error log or describe an error here
+# ══════════════════════════════════════════════════════════════════════════
+TEST_QUERIES = [
+    "NullReferenceException in TradeDataExtractor module, bot failed at line 142",
+    "Bot timed out while generating the daily P&L report",
+    "Configuration error — entity GBCIB not found in mapping file",
+]
+
+
+# ══════════════════════════════════════════════════════════════════════════
+# STEP 1 — Load and parse SOP CSV
+# ══════════════════════════════════════════════════════════════════════════
+def load_sop_csv(csv_path: str) -> list[Document]:
+    """
+    Load SOP CSV into LangChain Documents.
+    Each row becomes one document combining all relevant fields.
+    """
+    path = Path(csv_path)
+    if not path.exists():
+        print(f"\n⚠  CSV not found at: {csv_path}")
+        print("   Creating a sample CSV so you can see the expected format...\n")
+        _create_sample_csv(csv_path)
+
+    docs = []
+    with open(csv_path, newline="", encoding="utf-8") as f:
+        reader = csv.DictReader(f)
+        headers = reader.fieldnames or []
+
+        print(f"📄 CSV columns detected: {headers}")
+
+        for i, row in enumerate(reader):
+            # Build document text from available columns
+            # Tries your mapped column names, falls back gracefully
+            parts = []
+            for field, col in CSV_COLUMN_MAP.items():
+                val = row.get(col, "").strip()
+                if val:
+                    parts.append(f"{field.replace('_', ' ').title()}: {val}")
+
+            # If mapping didn't work, just use all columns
+            if not parts:
+                parts = [f"{k}: {v}" for k, v in row.items() if v.strip()]
+
+            content = "\n".join(parts)
+            if content.strip():
+                docs.append(Document(
+                    page_content=content,
+                    metadata={
+                        "row_num":      i + 1,
+                        "source":       "sop_csv",
+                        "sop_ref":      row.get(CSV_COLUMN_MAP["sop_ref"], f"ROW-{i+1}"),
+                        "module":       row.get(CSV_COLUMN_MAP["module"], ""),
+                        "rerun_safe":   row.get(CSV_COLUMN_MAP["rerun_safe"], "Unknown"),
+                    }
+                ))
+
+    print(f"✅ Loaded {len(docs)} SOP records from CSV\n")
+    return docs
+
+
+def _create_sample_csv(path: str):
+    """Create a sample CSV if none exists — shows expected format."""
+    sample_rows = [
+        {
+            "error_pattern": "NullReferenceException in TradeDataExtractor",
+            "root_cause":    "Entity config mapping missing in S3 config file",
+            "fix_steps":     "1. Navigate to config folder\n2. Open entity_mappings.json\n3. Add missing entity entry\n4. Save and rerun the bot",
+            "module":        "TradeDataExtractor",
+            "rerun_safe":    "Yes",
+            "sop_ref":       "SOP-GBOT-001",
+        },
+        {
+            "error_pattern": "TimeoutException in ReportGenerator",
+            "root_cause":    "Database query timeout due to large dataset on month-end",
+            "fix_steps":     "1. Wait 10 minutes for DB load to reduce\n2. Rerun bot during off-peak hours\n3. If persists, contact L2",
+            "module":        "ReportGenerator",
+            "rerun_safe":    "Yes",
+            "sop_ref":       "SOP-GBOT-002",
+        },
+        {
+            "error_pattern": "FileNotFoundException in ConfigLoader",
+            "root_cause":    "Config file missing from expected path after environment refresh",
+            "fix_steps":     "1. Check if config file exists at expected path\n2. If missing, copy from backup location\n3. Rerun bot",
+            "module":        "ConfigLoader",
+            "rerun_safe":    "Yes",
+            "sop_ref":       "SOP-GBOT-003",
+        },
+        {
+            "error_pattern": "AuthenticationException in DataConnector",
+            "root_cause":    "Service account credentials expired",
+            "fix_steps":     "Do NOT rerun. Escalate to L2 immediately for credential refresh.",
+            "module":        "DataConnector",
+            "rerun_safe":    "No",
+            "sop_ref":       "SOP-GBOT-004",
+        },
+    ]
+    with open(path, "w", newline="", encoding="utf-8") as f:
+        w = csv.DictWriter(f, fieldnames=list(sample_rows[0].keys()))
+        w.writeheader()
+        w.writerows(sample_rows)
+    print(f"   ✅ Sample CSV created at: {path}")
+    print(f"   👉 Replace with your real SOP data and rerun\n")
+
+
+# ══════════════════════════════════════════════════════════════════════════
+# STEP 2 — Build FAISS index (or load existing)
+# ══════════════════════════════════════════════════════════════════════════
+def get_or_build_index(docs: list[Document]) -> FAISS:
+    """
+    If FAISS index already exists on disk, load it.
+    Otherwise embed all docs and build fresh index.
+    """
+    embeddings = AzureOpenAIEmbeddings(
+        azure_deployment=CONFIG["embed_deployment"],
+        azure_endpoint=CONFIG["azure_endpoint"],
+        api_key=CONFIG["azure_api_key"],
+        api_version=CONFIG["azure_api_version"],
+    )
+
+    faiss_path = CONFIG["faiss_path"]
+
+    if Path(faiss_path).exists():
+        print(f"📦 Loading existing FAISS index from {faiss_path}...")
+        vs = FAISS.load_local(faiss_path, embeddings, allow_dangerous_deserialization=True)
+        print(f"✅ Index loaded\n")
+        return vs
+
+    print(f"🔨 Building new FAISS index (embedding {len(docs)} documents)...")
+    print(f"   Model: {CONFIG['embed_deployment']}")
+
+    # Chunk documents for better retrieval
+    splitter = RecursiveCharacterTextSplitter(chunk_size=400, chunk_overlap=40)
+    chunks   = splitter.split_documents(docs)
+    print(f"   Chunked into {len(chunks)} segments")
+
+    vs = FAISS.from_documents(chunks, embeddings)
+    vs.save_local(faiss_path)
+    print(f"✅ FAISS index built and saved to {faiss_path}\n")
+    return vs
+
+
+# ══════════════════════════════════════════════════════════════════════════
+# STEP 3 — Retrieve similar SOPs for a query
+# ══════════════════════════════════════════════════════════════════════════
+def retrieve(vs: FAISS, query: str, top_k: int = 3) -> list[tuple]:
+    """
+    Embed query and find top-k most similar SOP entries.
+    Returns list of (Document, similarity_score) tuples.
+    """
+    results = vs.similarity_search_with_relevance_scores(query, k=top_k)
+    return results
+
+
+# ══════════════════════════════════════════════════════════════════════════
+# STEP 4 — Call GPT-4.1 with retrieved context
+# ══════════════════════════════════════════════════════════════════════════
+SYSTEM_PROMPT = """You are a deterministic L1 triage agent for Genie Bot production support.
+Analyse the user's error against the retrieved SOP entries and respond with structured JSON.
+
+RULES:
+- Temperature=0. Only use information from the retrieved SOPs. Never invent fixes.
+- plain_english_fix must be written for a non-technical business user. No jargon. No code.
+- rerun_safe=true ONLY if the SOP explicitly says the fix is safe to rerun.
+- If no good match is found, set decision to ESCALATE.
+
+Respond ONLY with valid JSON:
+{
+  "decision": "L1_FIX_AVAILABLE" or "ESCALATE",
+  "confidence": "HIGH" or "MEDIUM" or "LOW",
+  "root_cause": "plain English explanation of what went wrong",
+  "plain_english_fix": "numbered steps a non-technical user can follow",
+  "rerun_safe": true or false,
+  "sop_reference": "SOP ref if found, else null",
+  "reasoning": "brief explanation of why this decision was made"
+}"""
+
+
+def call_llm(query: str, retrieved_docs: list[tuple]) -> dict:
+    """
+    Send query + retrieved SOP context to GPT-4.1.
+    Returns parsed JSON response.
+    """
+    llm = AzureChatOpenAI(
+        azure_deployment=CONFIG["llm_deployment"],
+        azure_endpoint=CONFIG["azure_endpoint"],
+        api_key=CONFIG["azure_api_key"],
+        api_version=CONFIG["azure_api_version"],
+        temperature=0.0,     # Always 0 — deterministic
+        max_tokens=800,
+    )
+
+    # Build context string from retrieved SOPs
+    context_parts = []
+    for i, (doc, score) in enumerate(retrieved_docs, 1):
+        context_parts.append(
+            f"--- SOP Match {i} (similarity score: {score:.3f}) ---\n"
+            f"{doc.page_content}"
+        )
+    context_str = "\n\n".join(context_parts)
+
+    user_message = (
+        f"ERROR LOG / QUERY:\n{query}\n\n"
+        f"RETRIEVED SOP ENTRIES:\n{context_str}\n\n"
+        f"Provide your JSON diagnosis now."
+    )
+
+    response = llm.invoke([
+        ("system", SYSTEM_PROMPT),
+        ("human",  user_message),
+    ])
+
+    raw = response.content.strip()
+
+    # Parse JSON — handle cases where model adds markdown fences
+    clean = raw.lstrip("```json").lstrip("```").rstrip("```").strip()
+    try:
+        return json.loads(clean)
+    except json.JSONDecodeError:
+        return {
+            "decision":         "ESCALATE",
+            "confidence":       "LOW",
+            "root_cause":       "Could not parse LLM response",
+            "plain_english_fix":"Please escalate to the support team.",
+            "rerun_safe":       False,
+            "sop_reference":    None,
+            "reasoning":        f"JSON parse failed. Raw response: {raw[:200]}",
+        }
+
+
+# ══════════════════════════════════════════════════════════════════════════
+# STEP 5 — Pretty-print the full result
+# ══════════════════════════════════════════════════════════════════════════
+def print_result(query: str, retrieved: list[tuple], llm_response: dict):
+    """Print a clean, readable summary of the full RAG pipeline result."""
+    w = 70
+    print("=" * w)
+    print("QUERY:")
+    print(textwrap.fill(query, width=w, initial_indent="  "))
+    print()
+
+    print("── RETRIEVED SOP MATCHES ──────────────────────────────────────")
+    for i, (doc, score) in enumerate(retrieved, 1):
+        colour = "✅" if score >= 0.75 else "🟡" if score >= 0.50 else "❌"
+        print(f"  {colour} Match {i}: score={score:.4f}  ref={doc.metadata.get('sop_ref','?')}")
+        # Show first line of the SOP content
+        first_line = doc.page_content.split("\n")[0]
+        print(f"     {first_line[:80]}")
+    print()
+
+    print("── LLM RESPONSE (GPT-4.1) ─────────────────────────────────────")
+    decision = llm_response.get("decision", "?")
+    conf     = llm_response.get("confidence", "?")
+    icon     = "✅" if decision == "L1_FIX_AVAILABLE" else "🔴"
+    print(f"  {icon} Decision:    {decision}  ({conf} confidence)")
+    print()
+
+    root = llm_response.get("root_cause", "")
+    if root:
+        print(f"  Root Cause:")
+        print(textwrap.fill(root, width=w, initial_indent="    "))
+        print()
+
+    fix = llm_response.get("plain_english_fix", "")
+    if fix:
+        print(f"  Fix (plain English for user):")
+        for line in fix.split("\n"):
+            print(f"    {line}")
+        print()
+
+    print(f"  Rerun Safe:   {'Yes ✅' if llm_response.get('rerun_safe') else 'No ❌ — manual rerun only'}")
+    print(f"  SOP Ref:      {llm_response.get('sop_reference') or 'None found'}")
+
+    reasoning = llm_response.get("reasoning", "")
+    if reasoning:
+        print(f"\n  Reasoning:    {reasoning[:120]}")
+
+    print("=" * w)
+    print()
+
+
+# ══════════════════════════════════════════════════════════════════════════
+# MAIN
+# ══════════════════════════════════════════════════════════════════════════
+def main():
+    print("\n🤖 Genie Bot RAG Pipeline — PoC Test")
+    print("=" * 70)
+    print(f"  LLM:        {CONFIG['llm_deployment']} on Azure OpenAI")
+    print(f"  Embeddings: {CONFIG['embed_deployment']}")
+    print(f"  SOP CSV:    {CONFIG['sop_csv_path']}")
+    print("=" * 70)
+    print()
+
+    # Step 1: Load SOP CSV
+    docs = load_sop_csv(CONFIG["sop_csv_path"])
+    if not docs:
+        print("❌ No documents loaded. Check your CSV path and column names.")
+        return
+
+    # Step 2: Build / load FAISS index
+    vs = get_or_build_index(docs)
+
+    # Step 3–5: Run each test query through the full pipeline
+    print(f"\n🔍 Running {len(TEST_QUERIES)} test queries...\n")
+
+    for i, query in enumerate(TEST_QUERIES, 1):
+        print(f"\n{'━'*70}")
+        print(f"  Test {i} of {len(TEST_QUERIES)}")
+        print(f"{'━'*70}")
+
+        # Retrieve
+        retrieved = retrieve(vs, query, top_k=3)
+
+        # Call LLM
+        print(f"  ⏳ Calling GPT-4.1...")
+        llm_resp = call_llm(query, retrieved)
+
+        # Print
+        print_result(query, retrieved, llm_resp)
+
+    print("\n✅ PoC complete. All queries processed.\n")
+    print("💡 Next steps:")
+    print("   1. Replace TEST_QUERIES with real Genie Bot error logs")
+    print("   2. Update CSV_COLUMN_MAP to match your actual CSV headers")
+    print("   3. Add more SOP rows to improve retrieval accuracy")
+    print("   4. Tune similarity thresholds (currently 0.75 = match)")
+    print()
+
+
+if __name__ == "__main__":
+    main()
