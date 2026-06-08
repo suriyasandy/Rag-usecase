@@ -539,9 +539,12 @@ elif st.session_state.stage == "l1_done":
 
     st.markdown("---")
 
-    # Debug
-    with st.expander("🔧 Raw RAG response (L1)", expanded=False):
-        st.json(st.session_state.l1_raw_resp)
+    # Debug — show only data.content.content
+    with st.expander("🔧 RAG response · data.content.content (L1)", expanded=False):
+        try:
+            st.text(st.session_state.l1_raw_resp["data"]["content"]["content"])
+        except Exception:
+            st.json(st.session_state.l1_raw_resp)
 
 
 # ── STAGE: L2 DONE — show L2 template exactly as returned by RAG ──────────
@@ -559,36 +562,187 @@ elif st.session_state.stage == "l2_done":
 
     st.markdown("---")
 
-    # L2 answer — show exactly as received from RAG
+    # ── L2 editable table ─────────────────────────────────────────────────
     st.markdown('<div class="l2box">', unsafe_allow_html=True)
-    st.markdown("### 📋 L2 Escalation Template")
-    st.caption("Pre-filled by RAG pipeline · Review · add comments · then submit")
-    st.markdown(fix_newlines(st.session_state.l2_answer))
+    st.markdown("### 📋 L2 Escalation Template — Pre-filled")
+    st.caption("Every field is editable · review · add comments · then submit")
     st.markdown("</div>", unsafe_allow_html=True)
 
+    # Parse the L2 answer into field → value pairs.
+    # Strategy (in order):
+    #   A) If user uploaded a template CSV → use those field names as row headers,
+    #      extract the matching values from the RAG markdown table
+    #   B) If no CSV → parse the RAG markdown table rows directly
+    #   C) Fallback → show a single editable text area
+
+    raw_answer  = fix_newlines(st.session_state.l2_answer)
+    tmpl_fields = st.session_state.get("template_fields", "")
+
+    def parse_markdown_table(text: str) -> dict:
+        """
+        Parse a markdown table of the form:
+          | Section | Field | Value | Notes |
+          |---------|-------|-------|-------|
+          | Routing | Suspected owner | ICE/vendor | ... |
+        Returns dict of {field: value} keeping the last column with real content.
+        Also handles simpler | Field | Value | tables.
+        """
+        rows = {}
+        lines = [l.strip() for l in text.splitlines() if l.strip()]
+        header = []
+        for line in lines:
+            if not line.startswith("|"):
+                continue
+            cells = [c.strip() for c in line.strip("|").split("|")]
+            cells = [c for c in cells if c]  # drop empty
+            if not cells:
+                continue
+            # Skip separator rows (--- lines)
+            if all(set(c.replace("-","").replace(":","").replace(" ","")) <= set() for c in cells):
+                continue
+            if all(c.replace("-","").replace(":","").strip() == "" for c in cells):
+                continue
+            # First real row = header
+            if not header:
+                header = cells
+                continue
+            if len(cells) < 2:
+                continue
+            # Try to find Field and Value columns from header
+            field_idx = next((i for i,h in enumerate(header)
+                              if "field" in h.lower()), 1)
+            val_idx   = next((i for i,h in enumerate(header)
+                              if "value" in h.lower()), min(2, len(cells)-1))
+            note_idx  = next((i for i,h in enumerate(header)
+                              if "note" in h.lower()), -1)
+            if field_idx < len(cells) and val_idx < len(cells):
+                field = cells[field_idx]
+                value = cells[val_idx]
+                note  = cells[note_idx] if note_idx >= 0 and note_idx < len(cells) else ""
+                if field and field not in ("Field","field","—","-"):
+                    rows[field] = {"value": value, "note": note}
+        return rows
+
+    def match_value(field_name: str, parsed: dict) -> str:
+        """Case-insensitive fuzzy match of field name → parsed table value."""
+        fn = field_name.lower().strip()
+        for k, v in parsed.items():
+            if fn in k.lower() or k.lower() in fn:
+                return v.get("value","")
+        return ""
+
+    # Parse the RAG markdown table
+    parsed_table = parse_markdown_table(raw_answer)
+
+    # Build the display rows
+    if tmpl_fields:
+        # Use uploaded CSV fields as the row structure
+        display_rows = []
+        for line in tmpl_fields.splitlines():
+            line = line.strip().lstrip("-").strip()
+            if not line: continue
+            # line format: "Field Name (mandatory): description"
+            if ":" in line:
+                fname, desc = line.split(":", 1)
+                fname = fname.replace("(mandatory)","").strip()
+                desc  = desc.strip()
+            else:
+                fname = line; desc = ""
+            is_mand = "(mandatory)" in line.lower()
+            prefill = match_value(fname, parsed_table)
+            display_rows.append({
+                "field": fname, "desc": desc,
+                "mandatory": is_mand, "value": prefill
+            })
+    elif parsed_table:
+        # Use the parsed RAG table rows
+        display_rows = [
+            {"field": k, "desc": v.get("note",""), "mandatory": False, "value": v.get("value","")}
+            for k, v in parsed_table.items()
+        ]
+    else:
+        display_rows = []  # fallback
+
+    filled = {}
+    if display_rows:
+        # Render as editable form with Field | Pre-filled Value layout
+        st.markdown("""
+<style>
+.tbl-hdr{display:grid;grid-template-columns:220px 1fr;gap:8px;
+         background:#1e3a5f;color:white;padding:8px 12px;border-radius:6px 6px 0 0;
+         font-weight:700;font-size:13px;margin-bottom:2px}
+.tbl-row{display:grid;grid-template-columns:220px 1fr;gap:8px;
+         align-items:center;padding:4px 0}
+.tbl-field{font-size:12px;font-weight:600;color:#1e3a5f;padding:4px 0}
+.tbl-mand{color:#dc2626;font-size:10px}
+.tbl-desc{font-size:10px;color:#6b7280;margin-top:1px}
+</style>
+""", unsafe_allow_html=True)
+
+        st.markdown('<div class="tbl-hdr"><div>Field</div><div>Pre-filled Value (editable)</div></div>',
+                    unsafe_allow_html=True)
+
+        for row in display_rows:
+            fname   = row["field"]
+            mand    = row["mandatory"]
+            desc    = row["desc"]
+            prefill = row["value"]
+
+            col_lbl, col_val = st.columns([2, 4])
+            with col_lbl:
+                star = " 🔴" if mand else ""
+                st.markdown(
+                    f"**{fname}**{star}",
+                    help=desc if desc else None,
+                )
+                if desc:
+                    st.caption(desc[:60])
+            with col_val:
+                filled[fname] = st.text_area(
+                    label=f"val_{fname}",
+                    value=prefill,
+                    height=60,
+                    key=f"field_{fname}",
+                    label_visibility="collapsed",
+                )
+
+        st.markdown("---")
+        col_a, col_b = st.columns([3,1])
+        extra = col_a.text_area(
+            "Additional Comments *(optional)*",
+            height=68, key="extra_comments",
+            placeholder="e.g. This started after the deployment on Friday…"
+        )
+        if extra: filled["Additional Comments"] = extra
+
+    else:
+        # Fallback: RAG returned free-text, not a markdown table
+        st.caption("RAG returned free-text — edit below:")
+        filled["content"] = st.text_area(
+            "L2 Template Content",
+            value=raw_answer, height=320, key="l2_freetext",
+        )
+        extra = st.text_area(
+            "Additional Comments *(optional)*",
+            height=68, key="extra_comments",
+            placeholder="e.g. This started after the deployment on Friday…"
+        )
+        if extra: filled["Additional Comments"] = extra
+
     st.markdown("---")
-
-    # Additional comments + submit
-    extra = st.text_area(
-        "Add any additional comments before submitting *(optional)*",
-        height=80, key="extra_comments",
-        placeholder="e.g. This started after the deployment on Friday…"
-    )
-
-    col_sub, col_copy, col_raw = st.columns(3)
-
+    col_sub, col_exp = st.columns(2)
     if col_sub.button("🚀 Submit to L2 Support Team",
                       type="primary", use_container_width=True):
         st.success(
             "✅ Ticket submitted to L2 queue. "
             "Wire your Jira agent here to create the ticket automatically."
         )
+    if col_exp.button("📋 Export as JSON", use_container_width=True):
+        st.code(__import__("json").dumps(filled, indent=2), language="json")
 
-    if col_copy.button("📋 Copy Template", use_container_width=True):
-        content = st.session_state.l2_answer
-        if extra: content += f"\n\nAdditional Comments:\n{extra}"
-        st.code(content, language="text")
-
-    # Debug
-    with st.expander("🔧 Raw RAG response (L2)", expanded=False):
-        st.json(st.session_state.l2_raw_resp)
+    # Debug — show only data.content.content
+    with st.expander("🔧 RAG response · data.content.content (L2)", expanded=False):
+        try:
+            st.text(st.session_state.l2_raw_resp["data"]["content"]["content"])
+        except Exception:
+            st.json(st.session_state.l2_raw_resp)
